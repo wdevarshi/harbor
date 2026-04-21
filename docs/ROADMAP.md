@@ -14,14 +14,17 @@
 - env-first app/bootstrap config
 - MCP server builder
 - MCP local integration client
-- HTTP ops surface with `/healthcheck` and `/readycheck`
+- HTTP ops surface with `/healthcheck`, `/readycheck`, and `/metrics`
+- tracing bootstrap
+- structured logging bootstrap
+- Prometheus recorder bootstrap
 - CLI scaffolding
 
 ## Phase 2 - Runtime and ops
-- metrics surface
-- tracing bootstrap
-- structured logging bootstrap
 - richer lifecycle hooks for background workers and subsystems
+- request/trace ID propagation
+- OTEL exporter bootstrap
+- middleware-based request logging
 
 ## Phase 3 - Richer AI integrations
 - Anthropic adapter

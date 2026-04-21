@@ -35,6 +35,8 @@ fn main() -> io::Result<()> {
             println!("- session memory: available");
             println!("- MCP server primitives: available");
             println!("- HTTP health/readiness surface: available");
+            println!("- tracing bootstrap: available");
+            println!("- Prometheus metrics surface: available");
             println!("- CLI scaffolding: available");
             Ok(())
         }

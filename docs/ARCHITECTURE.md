@@ -9,7 +9,8 @@ Harbor is a workspace of focused crates that compose into an AI application plat
 - **memory**: session and state retention
 - **runtime**: agents and workflows
 - **mcp**: MCP server/client protocol and transports
-- **http**: health/readiness and ops-facing HTTP surface
+- **http**: health/readiness/metrics and ops-facing HTTP surface
+- **observability**: tracing/log bootstrap and Prometheus setup
 - **cli**: project scaffolding and developer ergonomics
 
 ## Capability map
@@ -55,10 +56,18 @@ This keeps the framework from duplicating tool definitions between:
 The HTTP layer provides the operational surface around Harbor runtimes:
 - `/healthcheck`
 - `/readycheck`
+- `/metrics`
 - env-driven bind configuration
 - graceful shutdown hooks
 
 This is Harbor's equivalent of the production defaults that frameworks like ColdBrew expose for service operations.
+
+### 7. Observability
+The observability layer bootstraps the global cross-cutting runtime concerns:
+- tracing/log subscriber setup
+- log level + JSON log configuration
+- Prometheus recorder initialization
+- metrics rendering into the HTTP surface
 
 ## Why this shape
 

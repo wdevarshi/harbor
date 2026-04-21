@@ -2,6 +2,7 @@ use harbor_ai::{CompletionRequest, CompletionResponse, Message, MessageRole, Mod
 use harbor_core::{FrameworkError, FrameworkResult, ToolRegistry};
 use harbor_http::{HarborHttpConfig, HarborHttpServer, ReadinessGate};
 use harbor_memory::{MemoryMessage, SessionMemory};
+use harbor_observability::{HarborObservability, HarborObservabilityConfig};
 use serde::{Deserialize, Serialize};
 use std::env;
 
@@ -97,6 +98,9 @@ pub struct HarborAppConfig {
     pub environment: String,
     pub http_host: String,
     pub http_port: u16,
+    pub log_level: String,
+    pub json_logs: bool,
+    pub metrics_enabled: bool,
 }
 
 impl Default for HarborAppConfig {
@@ -107,6 +111,9 @@ impl Default for HarborAppConfig {
             environment: "dev".into(),
             http_host: "0.0.0.0".into(),
             http_port: 3000,
+            log_level: "info".into(),
+            json_logs: false,
+            metrics_enabled: true,
         }
     }
 }
@@ -137,6 +144,18 @@ impl HarborAppConfig {
             })?;
         }
 
+        if let Ok(log_level) = env::var("HARBOR_LOG_LEVEL") {
+            config.log_level = log_level;
+        }
+
+        if let Ok(json_logs) = env::var("HARBOR_JSON_LOGS") {
+            config.json_logs = matches!(json_logs.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+
+        if let Ok(metrics_enabled) = env::var("HARBOR_METRICS_ENABLED") {
+            config.metrics_enabled = !matches!(metrics_enabled.as_str(), "0" | "false" | "FALSE" | "no" | "NO");
+        }
+
         Ok(config)
     }
 
@@ -149,9 +168,20 @@ impl HarborAppConfig {
             environment: self.environment.clone(),
         }
     }
+
+    pub fn observability_config(&self) -> HarborObservabilityConfig {
+        HarborObservabilityConfig {
+            service_name: self.service_name.clone(),
+            service_version: self.service_version.clone(),
+            environment: self.environment.clone(),
+            log_level: self.log_level.clone(),
+            json_logs: self.json_logs,
+            metrics_enabled: self.metrics_enabled,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HarborApp {
     config: HarborAppConfig,
     readiness: ReadinessGate,
@@ -197,8 +227,15 @@ impl HarborApp {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        let observability = HarborObservability::init(&self.config.observability_config())?;
         self.readiness.set_ready(true);
-        self.http_server().run_with_shutdown(shutdown_signal).await
+
+        let mut server = self.http_server();
+        if let Some(renderer) = observability.metrics_renderer() {
+            server = server.with_metrics_renderer(renderer);
+        }
+
+        server.run_with_shutdown(shutdown_signal).await
     }
 }
 
@@ -209,7 +246,9 @@ pub async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
             signal.recv().await;
         }
     };

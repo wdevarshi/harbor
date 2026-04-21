@@ -1,5 +1,5 @@
 [package]
-name = "harbor-http"
+name = "harbor-observability"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,8 @@ description.workspace = true
 repository.workspace = true
 
 [dependencies]
-axum.workspace = true
-metrics.workspace = true
-serde.workspace = true
-tokio.workspace = true
 harbor-core = { path = "../harbor-core" }
-
-[[example]]
-name = "minimal_server"
-path = "examples/minimal_server.rs"
+metrics-exporter-prometheus.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

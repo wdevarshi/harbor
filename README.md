@@ -33,6 +33,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - reusable execution context
   - shared `HarborApp` bootstrap entrypoint
   - signal-driven shutdown wiring
+  - app-level observability integration
 - **`harbor-mcp`**
   - JSON-RPC + MCP-inspired protocol types
   - stdio framing (`Content-Length`)
@@ -40,9 +41,13 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - local integration client for tests and embedding
 - **`harbor-http`**
   - Axum-based HTTP ops surface
-  - `/healthcheck` and `/readycheck`
+  - `/healthcheck`, `/readycheck`, and `/metrics`
   - env-driven HTTP config
   - graceful shutdown hook support
+- **`harbor-observability`**
+  - tracing/log bootstrap
+  - Prometheus recorder setup
+  - metrics renderer for the HTTP surface
 - **`harbor-cli`**
   - `new` command to scaffold a new AI solution
   - `doctor` command to explain workspace capabilities
@@ -58,6 +63,7 @@ harbor/
     harbor-runtime/
     harbor-mcp/
     harbor-http/
+    harbor-observability/
     harbor-cli/
   docs/
     ARCHITECTURE.md
@@ -90,6 +96,13 @@ cargo run -p harbor-http --example minimal_server
 cargo run -p harbor-runtime --example bootstrap_http
 ```
 
+This boots Harbor with:
+- `/healthcheck`
+- `/readycheck`
+- `/metrics`
+- signal-driven shutdown
+- env-driven tracing/logging + metrics bootstrap
+
 ### Scaffold a new project
 
 ```bash
@@ -105,8 +118,6 @@ cargo run -p harbor-cli -- new my-ai-app --with-mcp-server
 
 ## Near-term roadmap
 
-- metrics surface
-- tracing bootstrap
 - Anthropic / Ollama provider adapters
 - HTTP transport for MCP integration
 - typed tool schemas via derive macros

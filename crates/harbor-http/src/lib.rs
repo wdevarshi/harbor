@@ -1,11 +1,12 @@
 use axum::{
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use harbor_core::{FrameworkError, FrameworkResult};
+use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -17,6 +18,8 @@ use std::{
     },
 };
 use tokio::net::TcpListener;
+
+pub type MetricsRenderer = Arc<dyn Fn() -> String + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarborHttpConfig {
@@ -69,10 +72,9 @@ impl HarborHttpConfig {
     }
 
     pub fn socket_addr(&self) -> FrameworkResult<SocketAddr> {
-        let ip: IpAddr = self
-            .host
-            .parse()
-            .map_err(|error| FrameworkError::Config(format!("invalid HTTP host '{}': {error}", self.host)))?;
+        let ip: IpAddr = self.host.parse().map_err(|error| {
+            FrameworkError::Config(format!("invalid HTTP host '{}': {error}", self.host))
+        })?;
         Ok(SocketAddr::new(ip, self.port))
     }
 }
@@ -114,19 +116,34 @@ impl Default for ReadinessGate {
 struct HarborHttpState {
     config: HarborHttpConfig,
     readiness: ReadinessGate,
+    metrics_renderer: Option<MetricsRenderer>,
 }
 
 pub fn router(config: HarborHttpConfig, readiness: ReadinessGate) -> Router {
+    router_with_metrics(config, readiness, None)
+}
+
+pub fn router_with_metrics(
+    config: HarborHttpConfig,
+    readiness: ReadinessGate,
+    metrics_renderer: Option<MetricsRenderer>,
+) -> Router {
     Router::new()
         .route("/healthcheck", get(healthcheck))
         .route("/readycheck", get(readycheck))
-        .with_state(HarborHttpState { config, readiness })
+        .route("/metrics", get(metrics_endpoint))
+        .with_state(HarborHttpState {
+            config,
+            readiness,
+            metrics_renderer,
+        })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HarborHttpServer {
     config: HarborHttpConfig,
     readiness: ReadinessGate,
+    metrics_renderer: Option<MetricsRenderer>,
 }
 
 impl HarborHttpServer {
@@ -134,11 +151,17 @@ impl HarborHttpServer {
         Self {
             config,
             readiness: ReadinessGate::default(),
+            metrics_renderer: None,
         }
     }
 
     pub fn with_readiness(mut self, readiness: ReadinessGate) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    pub fn with_metrics_renderer(mut self, metrics_renderer: MetricsRenderer) -> Self {
+        self.metrics_renderer = Some(metrics_renderer);
         self
     }
 
@@ -162,14 +185,24 @@ impl HarborHttpServer {
             .await
             .map_err(|error| FrameworkError::Transport(error.to_string()))?;
 
-        axum::serve(listener, router(self.config, self.readiness))
-            .with_graceful_shutdown(shutdown_signal)
-            .await
-            .map_err(|error| FrameworkError::Transport(error.to_string()))
+        axum::serve(
+            listener,
+            router_with_metrics(self.config, self.readiness, self.metrics_renderer),
+        )
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .map_err(|error| FrameworkError::Transport(error.to_string()))
     }
 }
 
 async fn healthcheck(State(state): State<HarborHttpState>) -> Json<ServiceStatusPayload> {
+    counter!(
+        "harbor_http_requests_total",
+        "route" => "/healthcheck",
+        "status" => "200"
+    )
+    .increment(1);
+
     Json(ServiceStatusPayload::from_config(&state.config, "ok", None))
 }
 
@@ -180,6 +213,15 @@ async fn readycheck(State(state): State<HarborHttpState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    let status_label = if ready { "200" } else { "503" };
+
+    gauge!("harbor_ready_state").set(if ready { 1.0 } else { 0.0 });
+    counter!(
+        "harbor_http_requests_total",
+        "route" => "/readycheck",
+        "status" => status_label
+    )
+    .increment(1);
 
     let status = if ready { "ready" } else { "not_ready" };
 
@@ -193,6 +235,41 @@ async fn readycheck(State(state): State<HarborHttpState>) -> impl IntoResponse {
     )
 }
 
+async fn metrics_endpoint(State(state): State<HarborHttpState>) -> Response {
+    match &state.metrics_renderer {
+        Some(render) => {
+            counter!(
+                "harbor_http_requests_total",
+                "route" => "/metrics",
+                "status" => "200"
+            )
+            .increment(1);
+
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                render(),
+            )
+                .into_response()
+        }
+        None => {
+            counter!(
+                "harbor_http_requests_total",
+                "route" => "/metrics",
+                "status" => "404"
+            )
+            .increment(1);
+
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "metrics disabled\n",
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ServiceStatusPayload {
     status: String,
@@ -204,7 +281,11 @@ struct ServiceStatusPayload {
 }
 
 impl ServiceStatusPayload {
-    fn from_config(config: &HarborHttpConfig, status: impl Into<String>, ready: Option<bool>) -> Self {
+    fn from_config(
+        config: &HarborHttpConfig,
+        status: impl Into<String>,
+        ready: Option<bool>,
+    ) -> Self {
         Self {
             status: status.into(),
             service: config.service_name.clone(),

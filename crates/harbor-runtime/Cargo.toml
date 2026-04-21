@@ -15,6 +15,7 @@ harbor-core = { path = "../harbor-core" }
 harbor-ai = { path = "../harbor-ai" }
 harbor-http = { path = "../harbor-http" }
 harbor-memory = { path = "../harbor-memory" }
+harbor-observability = { path = "../harbor-observability" }
 
 [[example]]
 name = "hello_agent"

@@ -8,6 +8,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         environment: "dev".into(),
         http_host: "0.0.0.0".into(),
         http_port: 3000,
+        log_level: "info".into(),
+        json_logs: false,
+        metrics_enabled: true,
     });
 
     println!(
