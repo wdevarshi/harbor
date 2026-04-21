@@ -13,8 +13,13 @@ serde_json.workspace = true
 tokio.workspace = true
 harbor-core = { path = "../harbor-core" }
 harbor-ai = { path = "../harbor-ai" }
+harbor-http = { path = "../harbor-http" }
 harbor-memory = { path = "../harbor-memory" }
 
 [[example]]
 name = "hello_agent"
 path = "examples/hello_agent.rs"
+
+[[example]]
+name = "bootstrap_http"
+path = "examples/bootstrap_http.rs"

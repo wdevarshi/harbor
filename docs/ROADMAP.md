@@ -9,18 +9,19 @@
 - session memory abstraction
 - agent runtime
 - workflow engine
+- shared `HarborApp` runtime/bootstrap entrypoint
+- signal-driven graceful shutdown wiring for the shared app runtime
+- env-first app/bootstrap config
 - MCP server builder
 - MCP local integration client
 - HTTP ops surface with `/healthcheck` and `/readycheck`
 - CLI scaffolding
 
 ## Phase 2 - Runtime and ops
-- shared runtime/bootstrap entrypoint
-- graceful shutdown wiring across runtimes
-- env-first config helpers across crates
 - metrics surface
 - tracing bootstrap
 - structured logging bootstrap
+- richer lifecycle hooks for background workers and subsystems
 
 ## Phase 3 - Richer AI integrations
 - Anthropic adapter

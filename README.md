@@ -31,6 +31,8 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - agent runtime
   - workflow engine
   - reusable execution context
+  - shared `HarborApp` bootstrap entrypoint
+  - signal-driven shutdown wiring
 - **`harbor-mcp`**
   - JSON-RPC + MCP-inspired protocol types
   - stdio framing (`Content-Length`)
@@ -82,6 +84,12 @@ cargo run -p harbor-mcp --example echo_stdio_server
 cargo run -p harbor-http --example minimal_server
 ```
 
+### Run the shared Harbor bootstrap example
+
+```bash
+cargo run -p harbor-runtime --example bootstrap_http
+```
+
 ### Scaffold a new project
 
 ```bash
@@ -97,6 +105,8 @@ cargo run -p harbor-cli -- new my-ai-app --with-mcp-server
 
 ## Near-term roadmap
 
+- metrics surface
+- tracing bootstrap
 - Anthropic / Ollama provider adapters
 - HTTP transport for MCP integration
 - typed tool schemas via derive macros

@@ -42,6 +42,8 @@ Runtime orchestrates:
 - provider invocation
 - tool registry access
 - workflow state transitions
+- shared application bootstrap (`HarborApp`)
+- signal-driven shutdown and readiness wiring
 
 ### 5. MCP
 The MCP layer turns the same tool registry into an MCP server.

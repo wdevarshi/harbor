@@ -31,6 +31,7 @@ fn main() -> io::Result<()> {
             println!("- provider abstraction: available");
             println!("- OpenAI-compatible provider: available");
             println!("- agent runtime: available");
+            println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");
             println!("- MCP server primitives: available");
             println!("- HTTP health/readiness surface: available");
