@@ -58,6 +58,12 @@ This keeps the framework from duplicating tool definitions between:
 - internal runtime use
 - external MCP integrations
 
+The current MCP baseline includes:
+- in-process/local client usage
+- stdio framing for process-based transports
+- HTTP transport for remote MCP-style integration
+- outbound trace-context injection for MCP HTTP client calls
+
 ### 6. HTTP / ops
 The HTTP layer provides the operational surface around Harbor runtimes:
 - `/healthcheck`

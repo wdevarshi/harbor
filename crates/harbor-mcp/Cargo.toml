@@ -9,12 +9,24 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
+opentelemetry.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
 harbor-core = { path = "../harbor-core" }
+
+[dev-dependencies]
+opentelemetry_sdk.workspace = true
 
 [[example]]
 name = "echo_stdio_server"
 path = "examples/echo_stdio_server.rs"
+
+[[example]]
+name = "http_server"
+path = "examples/http_server.rs"

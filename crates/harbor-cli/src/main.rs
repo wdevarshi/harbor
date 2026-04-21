@@ -35,6 +35,8 @@ fn main() -> io::Result<()> {
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");
             println!("- MCP server primitives: available");
+            println!("- MCP HTTP transport: available");
+            println!("- MCP HTTP trace propagation: available");
             println!("- HTTP health/readiness surface: available");
             println!("- request ID propagation: available");
             println!("- request logging middleware: available");

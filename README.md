@@ -40,7 +40,9 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - JSON-RPC + MCP-inspired protocol types
   - stdio framing (`Content-Length`)
   - MCP server builder
-  - local integration client for tests and embedding
+  - HTTP transport for remote MCP integration
+  - local + HTTP integration clients
+  - outbound trace-context injection for MCP HTTP calls
 - **`harbor-http`**
   - Axum-based HTTP ops surface
   - `/healthcheck`, `/readycheck`, and `/metrics`
@@ -94,6 +96,12 @@ cargo run -p harbor-runtime --example hello_agent
 cargo run -p harbor-mcp --example echo_stdio_server
 ```
 
+### Run the MCP HTTP server example
+
+```bash
+cargo run -p harbor-mcp --example http_server
+```
+
 ### Run the HTTP ops server example
 
 ```bash
@@ -142,8 +150,6 @@ GitHub Actions now runs:
 ## Near-term roadmap
 
 - Ollama provider adapter
-- outbound trace-context propagation for MCP client requests
-- HTTP transport for MCP integration
 - typed tool schemas via derive macros
 - event streaming + observability hooks
 - vector memory backends
