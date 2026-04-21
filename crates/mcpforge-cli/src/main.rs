@@ -58,15 +58,9 @@ serde_json = "1"
     )?;
 
     let main_rs = if with_mcp_server {
-        r#"fn main() {
-    println!(\"Hello from your MCPForge app with MCP server support\");
-}
-"#
+        "fn main() {\n    println!(\"Hello from your MCPForge app with MCP server support\");\n}\n"
     } else {
-        r#"fn main() {
-    println!(\"Hello from your MCPForge app\");
-}
-"#
+        "fn main() {\n    println!(\"Hello from your MCPForge app\");\n}\n"
     };
 
     fs::write(root.join("src/main.rs"), main_rs)?;
