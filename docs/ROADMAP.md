@@ -5,6 +5,7 @@
 - provider abstraction
 - mock provider
 - OpenAI-compatible provider client
+- Anthropic provider client
 - tool registry
 - session memory abstraction
 - agent runtime
@@ -29,9 +30,9 @@
 - outbound trace-context propagation for MCP client requests
 - richer HTTP middleware stack (timeouts, auth hooks, rate limits)
 - OTEL log/metric exporter options
+- broader behavioral test coverage across crates
 
 ## Phase 3 - Richer AI integrations
-- Anthropic adapter
 - Ollama / local model adapter
 - retry, timeout, and fallback policies
 - structured output helpers

@@ -18,6 +18,9 @@ tracing-opentelemetry.workspace = true
 uuid.workspace = true
 harbor-core = { path = "../harbor-core" }
 
+[dev-dependencies]
+reqwest.workspace = true
+
 [[example]]
 name = "minimal_server"
 path = "examples/minimal_server.rs"

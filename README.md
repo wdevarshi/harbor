@@ -24,6 +24,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - structured completion request/response model
   - mock provider for local development and tests
   - OpenAI-compatible provider client
+  - Anthropic provider client
   - outbound trace-context injection on provider HTTP calls
 - **`harbor-memory`**
   - session memory trait
@@ -140,7 +141,7 @@ GitHub Actions now runs:
 
 ## Near-term roadmap
 
-- Anthropic / Ollama provider adapters
+- Ollama provider adapter
 - outbound trace-context propagation for MCP client requests
 - HTTP transport for MCP integration
 - typed tool schemas via derive macros

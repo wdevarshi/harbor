@@ -30,6 +30,7 @@ fn main() -> io::Result<()> {
             println!("Harbor doctor");
             println!("- provider abstraction: available");
             println!("- OpenAI-compatible provider: available");
+            println!("- Anthropic provider: available");
             println!("- agent runtime: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");

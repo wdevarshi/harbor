@@ -22,6 +22,10 @@ Provider abstraction is intentionally separate from runtime so the framework can
 - hosted API providers
 - future routing/fallback layers
 
+The current baseline includes:
+- OpenAI-compatible HTTP providers
+- Anthropic HTTP providers
+
 Hosted HTTP providers can also inherit the current trace context so model/API calls participate in the same distributed trace when Harbor is running with OTEL enabled.
 
 ### 2. Tools

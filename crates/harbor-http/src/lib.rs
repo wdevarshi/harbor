@@ -384,3 +384,65 @@ impl Extractor for HeaderExtractor<'_> {
             .collect::<Vec<_>>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode as HttpStatusCode;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn readycheck_returns_503_and_echoes_request_id() {
+        let config = HarborHttpConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            service_name: "harbor-http-test".into(),
+            service_version: "0.1.0".into(),
+            environment: "test".into(),
+        };
+        let readiness = ReadinessGate::not_ready();
+        let base_url = spawn_router(router(config, readiness)).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base_url}/readycheck"))
+            .header(REQUEST_ID_HEADER, "req-http-test-1")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-http-test-1"
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("not_ready"));
+        assert!(body.contains("harbor-http-test"));
+    }
+
+    #[tokio::test]
+    async fn metrics_returns_404_when_disabled() {
+        let config = HarborHttpConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            service_name: "harbor-http-test".into(),
+            service_version: "0.1.0".into(),
+            environment: "test".into(),
+        };
+        let base_url = spawn_router(router(config, ReadinessGate::ready())).await;
+
+        let response = reqwest::get(format!("{base_url}/metrics")).await.unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::NOT_FOUND);
+        assert_eq!(response.text().await.unwrap(), "metrics disabled\n");
+    }
+
+    async fn spawn_router(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{}", address)
+    }
+}

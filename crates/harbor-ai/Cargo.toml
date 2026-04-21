@@ -17,3 +17,8 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 harbor-core = { path = "../harbor-core" }
+
+[dev-dependencies]
+axum.workspace = true
+opentelemetry_sdk.workspace = true
+tokio.workspace = true
