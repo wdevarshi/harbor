@@ -9,8 +9,11 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+opentelemetry.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
 harbor-core = { path = "../harbor-core" }

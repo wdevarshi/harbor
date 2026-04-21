@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use harbor_core::{FrameworkError, FrameworkResult, JsonValue, ToolSpec};
-use reqwest::Client;
+use opentelemetry::{global, propagation::Injector};
+use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Client};
 use serde::{Deserialize, Serialize};
 use std::env;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +191,9 @@ impl ModelProvider for OpenAICompatibleProvider {
             content: message.content,
         }));
 
+        let mut headers = HeaderMap::new();
+        inject_trace_context(&mut headers);
+
         let response = self
             .client
             .post(format!(
@@ -195,6 +201,7 @@ impl ModelProvider for OpenAICompatibleProvider {
                 self.config.base_url.trim_end_matches('/')
             ))
             .bearer_auth(&self.config.api_key)
+            .headers(headers)
             .json(&OpenAIChatRequest {
                 model: model.clone(),
                 messages: api_messages,
@@ -263,4 +270,24 @@ struct OpenAIChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAIMessageResponse {
     content: Option<String>,
+}
+
+fn inject_trace_context(headers: &mut HeaderMap) {
+    let context = Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut HeaderInjector(headers));
+    });
+}
+
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, value);
+        }
+    }
 }

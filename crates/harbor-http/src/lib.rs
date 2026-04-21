@@ -1,6 +1,6 @@
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -8,6 +8,7 @@ use axum::{
 };
 use harbor_core::{FrameworkError, FrameworkResult};
 use metrics::{counter, gauge, histogram};
+use opentelemetry::{global, propagation::Extractor};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -20,7 +21,8 @@ use std::{
     time::Instant,
 };
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{field, info, info_span, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -217,24 +219,42 @@ async fn request_context_middleware(
     next: Next,
 ) -> Response {
     let request_id = request_id_from_headers(request.headers());
-    request
-        .extensions_mut()
-        .insert(RequestContext {
-            request_id: request_id.clone(),
-        });
+    request.extensions_mut().insert(RequestContext {
+        request_id: request_id.clone(),
+    });
 
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
     let started_at = Instant::now();
 
-    let mut response = next.run(request).await;
+    let span = info_span!(
+        "http.request",
+        service = %state.config.service_name.as_str(),
+        environment = %state.config.environment.as_str(),
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        status = field::Empty,
+        duration_ms = field::Empty,
+        "otel.kind" = "server",
+        "http.request.method" = %method,
+        "url.path" = %path,
+        "service.name" = %state.config.service_name.as_str(),
+        "service.version" = %state.config.service_version.as_str(),
+        "deployment.environment.name" = %state.config.environment.as_str(),
+        "http.response.status_code" = field::Empty,
+    );
+
+    let parent_context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(request.headers())));
+    let _ = span.set_parent(parent_context);
+
+    let mut response = next.run(request).instrument(span.clone()).await;
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     let status = response.status().as_u16().to_string();
 
     if let Ok(value) = HeaderValue::from_str(&request_id) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
 
     counter!(
@@ -253,16 +273,20 @@ async fn request_context_middleware(
     )
     .record(duration_ms);
 
-    info!(
-        service = %state.config.service_name.as_str(),
-        environment = %state.config.environment.as_str(),
-        request_id = %request_id,
-        method = %method,
-        path = %path,
-        status = %status,
-        duration_ms = duration_ms,
-        "harbor http request"
+    span.record("status", field::display(status.as_str()));
+    span.record(
+        "http.response.status_code",
+        field::display(status.as_str()),
     );
+    span.record("duration_ms", duration_ms);
+
+    span.in_scope(|| {
+        info!(
+            status = %status,
+            duration_ms = duration_ms,
+            "harbor http request"
+        );
+    });
 
     response
 }
@@ -344,4 +368,19 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>()
+    }
 }

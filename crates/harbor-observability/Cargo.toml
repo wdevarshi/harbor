@@ -10,6 +10,10 @@ repository.workspace = true
 [dependencies]
 harbor-core = { path = "../harbor-core" }
 metrics-exporter-prometheus.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 serde.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true

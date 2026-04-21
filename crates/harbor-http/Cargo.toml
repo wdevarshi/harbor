@@ -10,9 +10,11 @@ repository.workspace = true
 [dependencies]
 axum.workspace = true
 metrics.workspace = true
+opentelemetry.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 uuid.workspace = true
 harbor-core = { path = "../harbor-core" }
 

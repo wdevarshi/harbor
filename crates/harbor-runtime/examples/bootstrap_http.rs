@@ -2,16 +2,12 @@ use harbor_runtime::{HarborApp, HarborAppConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = HarborApp::new(HarborAppConfig {
-        service_name: "harbor-bootstrap-example".into(),
-        service_version: "0.1.0".into(),
-        environment: "dev".into(),
-        http_host: "0.0.0.0".into(),
-        http_port: 3000,
-        log_level: "info".into(),
-        json_logs: false,
-        metrics_enabled: true,
-    });
+    let mut config = HarborAppConfig::from_env()?;
+    if config.service_name == "harbor-app" {
+        config.service_name = "harbor-bootstrap-example".into();
+    }
+
+    let app = HarborApp::new(config);
 
     println!(
         "Harbor app bootstrapping on http://{}:{}/healthcheck",

@@ -24,6 +24,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - structured completion request/response model
   - mock provider for local development and tests
   - OpenAI-compatible provider client
+  - outbound trace-context injection on provider HTTP calls
 - **`harbor-memory`**
   - session memory trait
   - in-memory implementation
@@ -49,6 +50,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
 - **`harbor-observability`**
   - tracing/log bootstrap
   - Prometheus recorder setup
+  - OTEL trace exporter bootstrap
   - metrics renderer for the HTTP surface
 - **`harbor-cli`**
   - `new` command to scaffold a new AI solution
@@ -108,9 +110,14 @@ This boots Harbor with:
 - `/readycheck`
 - `/metrics`
 - request ID propagation via `x-request-id`
+- incoming `traceparent` extraction when OTEL is enabled
 - request logging middleware
 - signal-driven shutdown
 - env-driven tracing/logging + metrics bootstrap
+
+Optional OTEL envs:
+- `HARBOR_OTEL_ENABLED=true`
+- `HARBOR_OTEL_ENDPOINT=http://127.0.0.1:4317`
 
 ### Scaffold a new project
 
@@ -134,6 +141,7 @@ GitHub Actions now runs:
 ## Near-term roadmap
 
 - Anthropic / Ollama provider adapters
+- outbound trace-context propagation for MCP client requests
 - HTTP transport for MCP integration
 - typed tool schemas via derive macros
 - event streaming + observability hooks

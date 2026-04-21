@@ -38,6 +38,8 @@ fn main() -> io::Result<()> {
             println!("- request ID propagation: available");
             println!("- request logging middleware: available");
             println!("- tracing bootstrap: available");
+            println!("- OTEL exporter bootstrap: available");
+            println!("- trace-context extraction: available");
             println!("- Prometheus metrics surface: available");
             println!("- CLI scaffolding: available");
             Ok(())

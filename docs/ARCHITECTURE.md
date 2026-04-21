@@ -22,6 +22,8 @@ Provider abstraction is intentionally separate from runtime so the framework can
 - hosted API providers
 - future routing/fallback layers
 
+Hosted HTTP providers can also inherit the current trace context so model/API calls participate in the same distributed trace when Harbor is running with OTEL enabled.
+
 ### 2. Tools
 Tools are defined once and reused in:
 - native runtime workflows
@@ -58,6 +60,7 @@ The HTTP layer provides the operational surface around Harbor runtimes:
 - `/readycheck`
 - `/metrics`
 - request ID propagation via `x-request-id`
+- incoming trace-context extraction from request headers
 - request logging middleware
 - env-driven bind configuration
 - graceful shutdown hooks
@@ -69,6 +72,8 @@ The observability layer bootstraps the global cross-cutting runtime concerns:
 - tracing/log subscriber setup
 - log level + JSON log configuration
 - Prometheus recorder initialization
+- OTLP trace exporter initialization
+- global W3C trace-context propagator setup
 - metrics rendering into the HTTP surface
 - structured request logs emitted by the HTTP middleware
 

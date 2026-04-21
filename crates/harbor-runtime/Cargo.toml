@@ -11,6 +11,7 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 harbor-core = { path = "../harbor-core" }
 harbor-ai = { path = "../harbor-ai" }
 harbor-http = { path = "../harbor-http" }

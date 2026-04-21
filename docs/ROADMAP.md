@@ -16,17 +16,19 @@
 - MCP local integration client
 - HTTP ops surface with `/healthcheck`, `/readycheck`, and `/metrics`
 - request ID propagation via `x-request-id`
+- incoming trace-context extraction / parent span wiring
 - middleware-based request logging
 - tracing bootstrap
 - structured logging bootstrap
 - Prometheus recorder bootstrap
+- OTEL exporter bootstrap
 - CLI scaffolding
 
 ## Phase 2 - Runtime and ops
 - richer lifecycle hooks for background workers and subsystems
-- trace ID propagation / OTEL context wiring
-- OTEL exporter bootstrap
+- outbound trace-context propagation for MCP client requests
 - richer HTTP middleware stack (timeouts, auth hooks, rate limits)
+- OTEL log/metric exporter options
 
 ## Phase 3 - Richer AI integrations
 - Anthropic adapter

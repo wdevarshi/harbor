@@ -5,6 +5,7 @@ use harbor_memory::{MemoryMessage, SessionMemory};
 use harbor_observability::{HarborObservability, HarborObservabilityConfig};
 use serde::{Deserialize, Serialize};
 use std::env;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct AgentRuntime<P, M> {
@@ -101,6 +102,8 @@ pub struct HarborAppConfig {
     pub log_level: String,
     pub json_logs: bool,
     pub metrics_enabled: bool,
+    pub otel_enabled: bool,
+    pub otel_endpoint: String,
 }
 
 impl Default for HarborAppConfig {
@@ -114,6 +117,8 @@ impl Default for HarborAppConfig {
             log_level: "info".into(),
             json_logs: false,
             metrics_enabled: true,
+            otel_enabled: false,
+            otel_endpoint: "http://127.0.0.1:4317".into(),
         }
     }
 }
@@ -156,6 +161,14 @@ impl HarborAppConfig {
             config.metrics_enabled = !matches!(metrics_enabled.as_str(), "0" | "false" | "FALSE" | "no" | "NO");
         }
 
+        if let Ok(otel_enabled) = env::var("HARBOR_OTEL_ENABLED") {
+            config.otel_enabled = matches!(otel_enabled.as_str(), "1" | "true" | "TRUE" | "yes" | "YES");
+        }
+
+        if let Ok(otel_endpoint) = env::var("HARBOR_OTEL_ENDPOINT") {
+            config.otel_endpoint = otel_endpoint;
+        }
+
         Ok(config)
     }
 
@@ -177,6 +190,8 @@ impl HarborAppConfig {
             log_level: self.log_level.clone(),
             json_logs: self.json_logs,
             metrics_enabled: self.metrics_enabled,
+            otel_enabled: self.otel_enabled,
+            otel_endpoint: self.otel_endpoint.clone(),
         }
     }
 }
@@ -235,7 +250,11 @@ impl HarborApp {
             server = server.with_metrics_renderer(renderer);
         }
 
-        server.run_with_shutdown(shutdown_signal).await
+        let result = server.run_with_shutdown(shutdown_signal).await;
+        if let Err(error) = observability.shutdown() {
+            warn!(error = %error, "harbor observability shutdown reported an error");
+        }
+        result
     }
 }
 
