@@ -9,6 +9,7 @@ Harbor is a workspace of focused crates that compose into an AI application plat
 - **memory**: session and state retention
 - **runtime**: agents and workflows
 - **mcp**: MCP server/client protocol and transports
+- **http**: health/readiness and ops-facing HTTP surface
 - **cli**: project scaffolding and developer ergonomics
 
 ## Capability map
@@ -47,6 +48,15 @@ The MCP layer turns the same tool registry into an MCP server.
 This keeps the framework from duplicating tool definitions between:
 - internal runtime use
 - external MCP integrations
+
+### 6. HTTP / ops
+The HTTP layer provides the operational surface around Harbor runtimes:
+- `/healthcheck`
+- `/readycheck`
+- env-driven bind configuration
+- graceful shutdown hooks
+
+This is Harbor's equivalent of the production defaults that frameworks like ColdBrew expose for service operations.
 
 ## Why this shape
 

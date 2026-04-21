@@ -23,6 +23,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - chat/message types
   - structured completion request/response model
   - mock provider for local development and tests
+  - OpenAI-compatible provider client
 - **`harbor-memory`**
   - session memory trait
   - in-memory implementation
@@ -35,6 +36,11 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - stdio framing (`Content-Length`)
   - MCP server builder
   - local integration client for tests and embedding
+- **`harbor-http`**
+  - Axum-based HTTP ops surface
+  - `/healthcheck` and `/readycheck`
+  - env-driven HTTP config
+  - graceful shutdown hook support
 - **`harbor-cli`**
   - `new` command to scaffold a new AI solution
   - `doctor` command to explain workspace capabilities
@@ -49,6 +55,7 @@ harbor/
     harbor-memory/
     harbor-runtime/
     harbor-mcp/
+    harbor-http/
     harbor-cli/
   docs/
     ARCHITECTURE.md
@@ -69,6 +76,12 @@ cargo run -p harbor-runtime --example hello_agent
 cargo run -p harbor-mcp --example echo_stdio_server
 ```
 
+### Run the HTTP ops server example
+
+```bash
+cargo run -p harbor-http --example minimal_server
+```
+
 ### Scaffold a new project
 
 ```bash
@@ -84,7 +97,7 @@ cargo run -p harbor-cli -- new my-ai-app --with-mcp-server
 
 ## Near-term roadmap
 
-- OpenAI / Anthropic provider adapters
+- Anthropic / Ollama provider adapters
 - HTTP transport for MCP integration
 - typed tool schemas via derive macros
 - event streaming + observability hooks

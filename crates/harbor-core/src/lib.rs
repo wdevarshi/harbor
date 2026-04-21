@@ -13,6 +13,8 @@ pub enum FrameworkError {
     ToolNotFound(String),
     #[error("invalid arguments: {0}")]
     InvalidArguments(String),
+    #[error("config error: {0}")]
+    Config(String),
     #[error("provider error: {0}")]
     Provider(String),
     #[error("memory error: {0}")]

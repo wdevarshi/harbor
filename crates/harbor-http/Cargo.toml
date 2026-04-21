@@ -1,5 +1,5 @@
 [package]
-name = "harbor-ai"
+name = "harbor-http"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,11 @@ description.workspace = true
 repository.workspace = true
 
 [dependencies]
-async-trait.workspace = true
-reqwest.workspace = true
+axum.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
+tokio.workspace = true
 harbor-core = { path = "../harbor-core" }
+
+[[example]]
+name = "minimal_server"
+path = "examples/minimal_server.rs"

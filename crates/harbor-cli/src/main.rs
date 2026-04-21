@@ -29,9 +29,11 @@ fn main() -> io::Result<()> {
         Commands::Doctor => {
             println!("Harbor doctor");
             println!("- provider abstraction: available");
+            println!("- OpenAI-compatible provider: available");
             println!("- agent runtime: available");
             println!("- session memory: available");
             println!("- MCP server primitives: available");
+            println!("- HTTP health/readiness surface: available");
             println!("- CLI scaffolding: available");
             Ok(())
         }

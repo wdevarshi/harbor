@@ -12,10 +12,12 @@ description = "AI-first Rust framework for building MCP-native solutions"
 
 [workspace.dependencies]
 async-trait = "0.1"
+axum = { version = "0.7", features = ["json", "http1", "tokio"] }
 clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "io-util", "process", "sync", "fs"] }
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "io-util", "process", "sync", "fs", "net"] }
 tracing = "0.1"
 uuid = { version = "1.8", features = ["v4", "serde"] }
