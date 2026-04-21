@@ -1,0 +1,12 @@
+[package]
+name = "mcpforge-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+mcpforge-core = { path = "../mcpforge-core" }
