@@ -32,6 +32,7 @@ fn main() -> io::Result<()> {
             println!("- OpenAI-compatible provider: available");
             println!("- Anthropic provider: available");
             println!("- Ollama provider: available");
+            println!("- provider retry/timeout/fallback helpers: available");
             println!("- agent runtime: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");

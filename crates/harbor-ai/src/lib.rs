@@ -6,7 +6,8 @@ use reqwest::{
     Client,
 };
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::{env, sync::Arc, time::Duration};
+use tokio::time::{sleep, timeout};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -86,6 +87,165 @@ pub struct CompletionResponse {
 pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &'static str;
     async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse>;
+}
+
+pub type SharedProvider = Arc<dyn ModelProvider>;
+
+pub fn shared_provider<P>(provider: P) -> SharedProvider
+where
+    P: ModelProvider + 'static,
+{
+    Arc::new(provider)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub attempts: usize,
+    pub delay_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            delay_ms: 100,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RetryProvider<P> {
+    inner: P,
+    policy: RetryPolicy,
+}
+
+impl<P> RetryProvider<P> {
+    pub fn new(inner: P, policy: RetryPolicy) -> Self {
+        Self { inner, policy }
+    }
+}
+
+#[async_trait]
+impl<P> ModelProvider for RetryProvider<P>
+where
+    P: ModelProvider,
+{
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        let attempts = self.policy.attempts.max(1);
+        let mut last_error = None;
+
+        for attempt in 0..attempts {
+            match self.inner.complete(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt + 1 < attempts && self.policy.delay_ms > 0 {
+                        sleep(Duration::from_millis(self.policy.delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            FrameworkError::Provider("retry provider exhausted without an error".into())
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub struct TimeoutProvider<P> {
+    inner: P,
+    timeout_ms: u64,
+}
+
+impl<P> TimeoutProvider<P> {
+    pub fn new(inner: P, timeout_ms: u64) -> Self {
+        Self {
+            inner,
+            timeout_ms: timeout_ms.max(1),
+        }
+    }
+}
+
+#[async_trait]
+impl<P> ModelProvider for TimeoutProvider<P>
+where
+    P: ModelProvider,
+{
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        timeout(
+            Duration::from_millis(self.timeout_ms),
+            self.inner.complete(request),
+        )
+        .await
+        .map_err(|_| {
+            FrameworkError::Provider(format!(
+                "provider '{}' timed out after {} ms",
+                self.inner.name(),
+                self.timeout_ms
+            ))
+        })?
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FallbackProvider {
+    providers: Vec<SharedProvider>,
+}
+
+impl FallbackProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_provider<P>(mut self, provider: P) -> Self
+    where
+        P: ModelProvider + 'static,
+    {
+        self.providers.push(shared_provider(provider));
+        self
+    }
+
+    pub fn push_shared(&mut self, provider: SharedProvider) {
+        self.providers.push(provider);
+    }
+}
+
+#[async_trait]
+impl ModelProvider for FallbackProvider {
+    fn name(&self) -> &'static str {
+        "fallback"
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        if self.providers.is_empty() {
+            return Err(FrameworkError::Provider(
+                "fallback provider has no configured inner providers".into(),
+            ));
+        }
+
+        let mut errors = Vec::new();
+
+        for provider in &self.providers {
+            match provider.complete(request.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(error) => errors.push(format!("{}: {}", provider.name(), error)),
+            }
+        }
+
+        Err(FrameworkError::Provider(format!(
+            "all fallback providers failed: {}",
+            errors.join(" | ")
+        )))
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -669,9 +829,154 @@ mod tests {
     };
     use opentelemetry_sdk::propagation::TraceContextPropagator;
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
     use tokio::net::TcpListener;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    #[derive(Clone)]
+    struct StaticProvider {
+        provider_name: &'static str,
+        text: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for StaticProvider {
+        fn name(&self) -> &'static str {
+            self.provider_name
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: self.text.clone(),
+                structured: None,
+                provider: self.provider_name.into(),
+                model: request.model,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FlakyProvider {
+        provider_name: &'static str,
+        failures_before_success: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for FlakyProvider {
+        fn name(&self) -> &'static str {
+            self.provider_name
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.failures_before_success {
+                Err(FrameworkError::Provider(format!(
+                    "{} failed on call {}",
+                    self.provider_name, call
+                )))
+            } else {
+                Ok(CompletionResponse {
+                    text: format!("{} ok", self.provider_name),
+                    structured: None,
+                    provider: self.provider_name.into(),
+                    model: request.model,
+                })
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct SlowProvider {
+        provider_name: &'static str,
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SlowProvider {
+        fn name(&self) -> &'static str {
+            self.provider_name
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(CompletionResponse {
+                text: format!("{} done", self.provider_name),
+                structured: None,
+                provider: self.provider_name.into(),
+                model: request.model,
+            })
+        }
+    }
+
+    fn sample_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "test-model".into(),
+            system_prompt: None,
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            tools: vec![],
+            response_schema: None,
+            session_id: None,
+            tool_choice: ToolChoice::Auto,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_provider_retries_until_success() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RetryProvider::new(
+            FlakyProvider {
+                provider_name: "flaky",
+                failures_before_success: 2,
+                calls: calls.clone(),
+            },
+            RetryPolicy {
+                attempts: 3,
+                delay_ms: 0,
+            },
+        );
+
+        let response = provider.complete(sample_request()).await.unwrap();
+        assert_eq!(response.provider, "flaky");
+        assert_eq!(response.text, "flaky ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn timeout_provider_returns_timeout_error() {
+        let provider = TimeoutProvider::new(
+            SlowProvider {
+                provider_name: "slow",
+                delay_ms: 50,
+            },
+            10,
+        );
+
+        let error = provider.complete(sample_request()).await.unwrap_err();
+        assert!(error.to_string().contains("timed out after 10 ms"));
+    }
+
+    #[tokio::test]
+    async fn fallback_provider_uses_second_provider_after_first_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FallbackProvider::new()
+            .with_provider(FlakyProvider {
+                provider_name: "first",
+                failures_before_success: usize::MAX,
+                calls,
+            })
+            .with_provider(StaticProvider {
+                provider_name: "second",
+                text: "fallback ok".into(),
+            });
+
+        let response = provider.complete(sample_request()).await.unwrap();
+        assert_eq!(response.provider, "second");
+        assert_eq!(response.text, "fallback ok");
+    }
 
     #[derive(Clone, Default)]
     struct CaptureState {

@@ -26,6 +26,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - OpenAI-compatible provider client
   - Anthropic provider client
   - Ollama provider client
+  - provider retry / timeout / fallback helpers
   - outbound trace-context injection on provider HTTP calls
 - **`harbor-memory`**
   - session memory trait
@@ -154,6 +155,7 @@ GitHub Actions now runs:
 ## Near-term roadmap
 
 - typed tool schemas via derive macros
+- structured output helpers
 - event streaming + observability hooks
 - vector memory backends
 - deployment templates for containerized AI services

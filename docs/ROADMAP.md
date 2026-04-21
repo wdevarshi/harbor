@@ -7,6 +7,7 @@
 - OpenAI-compatible provider client
 - Anthropic provider client
 - Ollama provider client
+- provider retry / timeout / fallback helpers
 - tool registry
 - session memory abstraction
 - agent runtime
@@ -35,7 +36,6 @@
 - broader behavioral test coverage across crates
 
 ## Phase 3 - Richer AI integrations
-- retry, timeout, and fallback policies
 - structured output helpers
 
 ## Phase 4 - Richer MCP support
