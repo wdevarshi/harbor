@@ -16,11 +16,11 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore, time::timeout};
 use tracing::{field, info, info_span, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -86,6 +86,71 @@ impl HarborHttpConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarborHttpMiddlewareConfig {
+    pub request_timeout_ms: Option<u64>,
+    pub concurrency_limit: Option<usize>,
+    pub rate_limit_requests: Option<u64>,
+    pub rate_limit_window_secs: u64,
+    pub bearer_token: Option<String>,
+}
+
+impl Default for HarborHttpMiddlewareConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_ms: None,
+            concurrency_limit: None,
+            rate_limit_requests: None,
+            rate_limit_window_secs: 1,
+            bearer_token: None,
+        }
+    }
+}
+
+impl HarborHttpMiddlewareConfig {
+    pub fn from_env() -> FrameworkResult<Self> {
+        let mut config = Self::default();
+
+        if let Ok(timeout_ms) = env::var("HARBOR_HTTP_TIMEOUT_MS") {
+            config.request_timeout_ms = Some(timeout_ms.parse().map_err(|error| {
+                FrameworkError::Config(format!("invalid HARBOR_HTTP_TIMEOUT_MS value: {error}"))
+            })?);
+        }
+
+        if let Ok(concurrency_limit) = env::var("HARBOR_HTTP_CONCURRENCY_LIMIT") {
+            config.concurrency_limit = Some(concurrency_limit.parse().map_err(|error| {
+                FrameworkError::Config(format!(
+                    "invalid HARBOR_HTTP_CONCURRENCY_LIMIT value: {error}"
+                ))
+            })?);
+        }
+
+        if let Ok(rate_limit_requests) = env::var("HARBOR_HTTP_RATE_LIMIT_REQUESTS") {
+            config.rate_limit_requests = Some(rate_limit_requests.parse().map_err(|error| {
+                FrameworkError::Config(format!(
+                    "invalid HARBOR_HTTP_RATE_LIMIT_REQUESTS value: {error}"
+                ))
+            })?);
+        }
+
+        if let Ok(rate_limit_window_secs) = env::var("HARBOR_HTTP_RATE_LIMIT_WINDOW_SECS") {
+            config.rate_limit_window_secs = rate_limit_window_secs.parse().map_err(|error| {
+                FrameworkError::Config(format!(
+                    "invalid HARBOR_HTTP_RATE_LIMIT_WINDOW_SECS value: {error}"
+                ))
+            })?;
+        }
+
+        if let Ok(bearer_token) = env::var("HARBOR_HTTP_BEARER_TOKEN") {
+            if !bearer_token.trim().is_empty() {
+                config.bearer_token = Some(bearer_token);
+            }
+        }
+
+        Ok(config)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReadinessGate {
     ready: Arc<AtomicBool>,
@@ -129,10 +194,85 @@ struct HarborHttpState {
     config: HarborHttpConfig,
     readiness: ReadinessGate,
     metrics_renderer: Option<MetricsRenderer>,
+    middleware: Arc<MiddlewareRuntime>,
+}
+
+#[derive(Debug)]
+struct MiddlewareRuntime {
+    config: HarborHttpMiddlewareConfig,
+    concurrency: Option<Arc<Semaphore>>,
+    rate_limiter: Option<Arc<FixedWindowRateLimiter>>,
+}
+
+impl MiddlewareRuntime {
+    fn new(config: HarborHttpMiddlewareConfig) -> Self {
+        let concurrency = config
+            .concurrency_limit
+            .map(|limit| Arc::new(Semaphore::new(limit.max(1))));
+        let rate_limiter = config.rate_limit_requests.map(|limit| {
+            Arc::new(FixedWindowRateLimiter::new(
+                limit.max(1),
+                Duration::from_secs(config.rate_limit_window_secs.max(1)),
+            ))
+        });
+
+        Self {
+            config,
+            concurrency,
+            rate_limiter,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FixedWindowRateLimiter {
+    max_requests: u64,
+    window: Duration,
+    state: Mutex<RateLimitState>,
+}
+
+#[derive(Debug)]
+struct RateLimitState {
+    started_at: Instant,
+    count: u64,
+}
+
+impl FixedWindowRateLimiter {
+    fn new(max_requests: u64, window: Duration) -> Self {
+        Self {
+            max_requests,
+            window,
+            state: Mutex::new(RateLimitState {
+                started_at: Instant::now(),
+                count: 0,
+            }),
+        }
+    }
+
+    fn allow(&self) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        if guard.started_at.elapsed() >= self.window {
+            guard.started_at = Instant::now();
+            guard.count = 0;
+        }
+
+        if guard.count < self.max_requests {
+            guard.count += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub fn router(config: HarborHttpConfig, readiness: ReadinessGate) -> Router {
-    router_with_metrics(config, readiness, None)
+    router_with_stack(
+        config,
+        readiness,
+        None,
+        HarborHttpMiddlewareConfig::default(),
+        Router::new(),
+    )
 }
 
 pub fn router_with_metrics(
@@ -140,21 +280,56 @@ pub fn router_with_metrics(
     readiness: ReadinessGate,
     metrics_renderer: Option<MetricsRenderer>,
 ) -> Router {
+    router_with_stack(
+        config,
+        readiness,
+        metrics_renderer,
+        HarborHttpMiddlewareConfig::default(),
+        Router::new(),
+    )
+}
+
+pub fn router_with_stack(
+    config: HarborHttpConfig,
+    readiness: ReadinessGate,
+    metrics_renderer: Option<MetricsRenderer>,
+    middleware_config: HarborHttpMiddlewareConfig,
+    app_router: Router,
+) -> Router {
     let state = HarborHttpState {
         config,
         readiness,
         metrics_renderer,
+        middleware: Arc::new(MiddlewareRuntime::new(middleware_config)),
     };
 
+    let protected_router = app_router.layer(middleware::from_fn_with_state(
+        state.clone(),
+        app_policy_middleware,
+    ));
+
+    let health_state = state.clone();
+    let ready_state = state.clone();
+    let metrics_state = state.clone();
+
     Router::new()
-        .route("/healthcheck", get(healthcheck))
-        .route("/readycheck", get(readycheck))
-        .route("/metrics", get(metrics_endpoint))
+        .merge(protected_router)
+        .route(
+            "/healthcheck",
+            get(move || healthcheck(health_state.clone())),
+        )
+        .route(
+            "/readycheck",
+            get(move || readycheck(ready_state.clone())),
+        )
+        .route(
+            "/metrics",
+            get(move || metrics_endpoint(metrics_state.clone())),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_context_middleware,
         ))
-        .with_state(state)
 }
 
 #[derive(Clone)]
@@ -162,6 +337,8 @@ pub struct HarborHttpServer {
     config: HarborHttpConfig,
     readiness: ReadinessGate,
     metrics_renderer: Option<MetricsRenderer>,
+    middleware_config: HarborHttpMiddlewareConfig,
+    app_router: Router,
 }
 
 impl HarborHttpServer {
@@ -170,6 +347,8 @@ impl HarborHttpServer {
             config,
             readiness: ReadinessGate::default(),
             metrics_renderer: None,
+            middleware_config: HarborHttpMiddlewareConfig::default(),
+            app_router: Router::new(),
         }
     }
 
@@ -180,6 +359,16 @@ impl HarborHttpServer {
 
     pub fn with_metrics_renderer(mut self, metrics_renderer: MetricsRenderer) -> Self {
         self.metrics_renderer = Some(metrics_renderer);
+        self
+    }
+
+    pub fn with_middleware_config(mut self, middleware_config: HarborHttpMiddlewareConfig) -> Self {
+        self.middleware_config = middleware_config;
+        self
+    }
+
+    pub fn with_app_router(mut self, app_router: Router) -> Self {
+        self.app_router = app_router;
         self
     }
 
@@ -205,7 +394,13 @@ impl HarborHttpServer {
 
         axum::serve(
             listener,
-            router_with_metrics(self.config, self.readiness, self.metrics_renderer),
+            router_with_stack(
+                self.config,
+                self.readiness,
+                self.metrics_renderer,
+                self.middleware_config,
+                self.app_router,
+            ),
         )
         .with_graceful_shutdown(shutdown_signal)
         .await
@@ -245,8 +440,9 @@ async fn request_context_middleware(
         "http.response.status_code" = field::Empty,
     );
 
-    let parent_context =
-        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(request.headers())));
+    let parent_context = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderExtractor(request.headers()))
+    });
     let _ = span.set_parent(parent_context);
 
     let mut response = next.run(request).instrument(span.clone()).await;
@@ -274,10 +470,7 @@ async fn request_context_middleware(
     .record(duration_ms);
 
     span.record("status", field::display(status.as_str()));
-    span.record(
-        "http.response.status_code",
-        field::display(status.as_str()),
-    );
+    span.record("http.response.status_code", field::display(status.as_str()));
     span.record("duration_ms", duration_ms);
 
     span.in_scope(|| {
@@ -291,11 +484,71 @@ async fn request_context_middleware(
     response
 }
 
-async fn healthcheck(State(state): State<HarborHttpState>) -> Json<ServiceStatusPayload> {
+async fn app_policy_middleware(
+    State(state): State<HarborHttpState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = state.middleware.config.bearer_token.as_ref() {
+        match bearer_token(request.headers()) {
+            Some(token) if token == expected => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "missing or invalid bearer token\n",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(rate_limiter) = &state.middleware.rate_limiter {
+        if !rate_limiter.allow() {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "rate limit exceeded\n",
+            )
+                .into_response();
+        }
+    }
+
+    let _permit = match &state.middleware.concurrency {
+        Some(semaphore) => match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "concurrency limit exceeded\n",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    let future = next.run(request);
+    match state.middleware.config.request_timeout_ms {
+        Some(timeout_ms) => match timeout(Duration::from_millis(timeout_ms.max(1)), future).await {
+            Ok(response) => response,
+            Err(_) => (
+                StatusCode::REQUEST_TIMEOUT,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "request timed out\n",
+            )
+                .into_response(),
+        },
+        None => future.await,
+    }
+}
+
+async fn healthcheck(state: HarborHttpState) -> Json<ServiceStatusPayload> {
     Json(ServiceStatusPayload::from_config(&state.config, "ok", None))
 }
 
-async fn readycheck(State(state): State<HarborHttpState>) -> impl IntoResponse {
+async fn readycheck(state: HarborHttpState) -> impl IntoResponse {
     let ready = state.readiness.is_ready();
     let status_code = if ready {
         StatusCode::OK
@@ -317,7 +570,7 @@ async fn readycheck(State(state): State<HarborHttpState>) -> impl IntoResponse {
     )
 }
 
-async fn metrics_endpoint(State(state): State<HarborHttpState>) -> Response {
+async fn metrics_endpoint(state: HarborHttpState) -> Response {
     match &state.metrics_renderer {
         Some(render) => (
             StatusCode::OK,
@@ -370,6 +623,15 @@ fn request_id_from_headers(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 struct HeaderExtractor<'a>(&'a HeaderMap);
 
 impl Extractor for HeaderExtractor<'_> {
@@ -378,10 +640,7 @@ impl Extractor for HeaderExtractor<'_> {
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0
-            .keys()
-            .map(|name| name.as_str())
-            .collect::<Vec<_>>()
+        self.0.keys().map(|name| name.as_str()).collect::<Vec<_>>()
     }
 }
 
@@ -389,7 +648,7 @@ impl Extractor for HeaderExtractor<'_> {
 mod tests {
     use super::*;
     use reqwest::StatusCode as HttpStatusCode;
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::oneshot, time::sleep};
 
     #[tokio::test]
     async fn readycheck_returns_503_and_echoes_request_id() {
@@ -437,6 +696,129 @@ mod tests {
         assert_eq!(response.text().await.unwrap(), "metrics disabled\n");
     }
 
+    #[tokio::test]
+    async fn app_router_requires_bearer_token() {
+        let base_url = spawn_router(router_with_stack(
+            test_config(),
+            ReadinessGate::ready(),
+            None,
+            HarborHttpMiddlewareConfig {
+                bearer_token: Some("secret-token".into()),
+                ..HarborHttpMiddlewareConfig::default()
+            },
+            Router::new().route("/protected", get(|| async { "ok" })),
+        ))
+        .await;
+
+        let unauthorized = reqwest::get(format!("{base_url}/protected")).await.unwrap();
+        assert_eq!(unauthorized.status(), HttpStatusCode::UNAUTHORIZED);
+
+        let authorized = reqwest::Client::new()
+            .get(format!("{base_url}/protected"))
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), HttpStatusCode::OK);
+        assert_eq!(authorized.text().await.unwrap(), "ok");
+
+        let health = reqwest::get(format!("{base_url}/healthcheck")).await.unwrap();
+        assert_eq!(health.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn app_router_times_out() {
+        let base_url = spawn_router(router_with_stack(
+            test_config(),
+            ReadinessGate::ready(),
+            None,
+            HarborHttpMiddlewareConfig {
+                request_timeout_ms: Some(25),
+                ..HarborHttpMiddlewareConfig::default()
+            },
+            Router::new().route(
+                "/slow",
+                get(|| async {
+                    sleep(Duration::from_millis(75)).await;
+                    "slow"
+                }),
+            ),
+        ))
+        .await;
+
+        let response = reqwest::get(format!("{base_url}/slow")).await.unwrap();
+        assert_eq!(response.status(), HttpStatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.text().await.unwrap(), "request timed out\n");
+    }
+
+    #[tokio::test]
+    async fn app_router_rate_limits_requests() {
+        let base_url = spawn_router(router_with_stack(
+            test_config(),
+            ReadinessGate::ready(),
+            None,
+            HarborHttpMiddlewareConfig {
+                rate_limit_requests: Some(1),
+                rate_limit_window_secs: 60,
+                ..HarborHttpMiddlewareConfig::default()
+            },
+            Router::new().route("/limited", get(|| async { "ok" })),
+        ))
+        .await;
+
+        let first = reqwest::get(format!("{base_url}/limited")).await.unwrap();
+        assert_eq!(first.status(), HttpStatusCode::OK);
+
+        let second = reqwest::get(format!("{base_url}/limited")).await.unwrap();
+        assert_eq!(second.status(), HttpStatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.text().await.unwrap(), "rate limit exceeded\n");
+    }
+
+    #[tokio::test]
+    async fn app_router_enforces_concurrency_limit() {
+        let (tx, rx) = oneshot::channel::<()>();
+        let rx = Arc::new(Mutex::new(Some(rx)));
+        let base_url = spawn_router(router_with_stack(
+            test_config(),
+            ReadinessGate::ready(),
+            None,
+            HarborHttpMiddlewareConfig {
+                concurrency_limit: Some(1),
+                ..HarborHttpMiddlewareConfig::default()
+            },
+            Router::new().route(
+                "/block",
+                get(move || {
+                    let rx = rx.clone();
+                    async move {
+                        let receiver = rx.lock().unwrap().take();
+                        if let Some(receiver) = receiver {
+                            let _ = receiver.await;
+                        }
+                        "done"
+                    }
+                }),
+            ),
+        ))
+        .await;
+
+        let client = reqwest::Client::new();
+        let first = tokio::spawn({
+            let client = client.clone();
+            let url = format!("{base_url}/block");
+            async move { client.get(url).send().await.unwrap() }
+        });
+
+        sleep(Duration::from_millis(25)).await;
+
+        let second = client.get(format!("{base_url}/block")).send().await.unwrap();
+        assert_eq!(second.status(), HttpStatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second.text().await.unwrap(), "concurrency limit exceeded\n");
+
+        let _ = tx.send(());
+        assert_eq!(first.await.unwrap().status(), HttpStatusCode::OK);
+    }
+
     async fn spawn_router(router: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -444,5 +826,15 @@ mod tests {
             axum::serve(listener, router).await.unwrap();
         });
         format!("http://{}", address)
+    }
+
+    fn test_config() -> HarborHttpConfig {
+        HarborHttpConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            service_name: "harbor-http-test".into(),
+            service_version: "0.1.0".into(),
+            environment: "test".into(),
+        }
     }
 }

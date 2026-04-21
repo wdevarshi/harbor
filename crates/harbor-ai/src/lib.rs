@@ -39,6 +39,14 @@ impl MessageRole {
             Self::Assistant | Self::Tool => Some("assistant"),
         }
     }
+
+    fn as_ollama_role(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant | Self::Tool => "assistant",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +407,124 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaConfig {
+    pub base_url: String,
+    pub default_model: String,
+}
+
+impl OllamaConfig {
+    pub fn from_env() -> FrameworkResult<Self> {
+        let base_url = env::var("OLLAMA_BASE_URL")
+            .or_else(|_| env::var("HARBOR_OLLAMA_BASE_URL"))
+            .unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+
+        let default_model = env::var("OLLAMA_MODEL")
+            .or_else(|_| env::var("HARBOR_OLLAMA_MODEL"))
+            .unwrap_or_else(|_| "llama3.2".into());
+
+        Ok(Self {
+            base_url,
+            default_model,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OllamaProvider {
+    client: Client,
+    config: OllamaConfig,
+}
+
+impl OllamaProvider {
+    pub fn new(config: OllamaConfig) -> Self {
+        Self {
+            client: Client::new(),
+            config,
+        }
+    }
+
+    pub fn from_env() -> FrameworkResult<Self> {
+        Ok(Self::new(OllamaConfig::from_env()?))
+    }
+
+    pub fn with_client(client: Client, config: OllamaConfig) -> Self {
+        Self { client, config }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for OllamaProvider {
+    fn name(&self) -> &'static str {
+        "ollama"
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        let CompletionRequest {
+            model,
+            system_prompt,
+            messages,
+            ..
+        } = request;
+
+        let model = model_or_default(model, &self.config.default_model);
+        let mut api_messages = Vec::new();
+
+        if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
+            api_messages.push(OllamaMessageRequest {
+                role: "system".into(),
+                content: system_prompt,
+            });
+        }
+
+        api_messages.extend(messages.into_iter().map(|message| OllamaMessageRequest {
+            role: message.role.as_ollama_role().into(),
+            content: message.content,
+        }));
+
+        let mut headers = HeaderMap::new();
+        inject_trace_context(&mut headers);
+
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.config.base_url.trim_end_matches('/')))
+            .headers(headers)
+            .json(&OllamaChatRequest {
+                model: model.clone(),
+                messages: api_messages,
+                stream: false,
+            })
+            .send()
+            .await
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?;
+
+        let response: OllamaChatResponse = response
+            .json()
+            .await
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?;
+
+        let text = response
+            .message
+            .and_then(|message| {
+                if message.content.trim().is_empty() {
+                    None
+                } else {
+                    Some(message.content)
+                }
+            })
+            .ok_or_else(|| FrameworkError::Provider("Ollama provider returned no assistant text response".into()))?;
+
+        Ok(CompletionResponse {
+            text,
+            structured: None,
+            provider: self.name().into(),
+            model: response.model.unwrap_or(model),
+        })
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct OpenAIChatRequest {
     model: String,
@@ -472,6 +598,30 @@ struct AnthropicContentBlockResponse {
     #[serde(rename = "type")]
     kind: String,
     text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<OllamaMessageRequest>,
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OllamaMessageRequest {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    model: Option<String>,
+    message: Option<OllamaMessageResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaMessageResponse {
+    content: String,
 }
 
 fn model_or_default(model: String, default_model: &str) -> String {
@@ -645,6 +795,102 @@ mod tests {
             "content": [
                 { "type": "text", "text": "Hi from Anthropic" }
             ]
+        }))
+    }
+
+    #[tokio::test]
+    async fn ollama_provider_maps_request_and_response() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let state = CaptureState::default();
+        let app = Router::new().route("/api/chat", post(ollama_handler)).with_state(state.clone());
+        let base_url = spawn_router(app).await;
+
+        let provider = OllamaProvider::new(OllamaConfig {
+            base_url,
+            default_model: "llama-test-model".into(),
+        });
+
+        let parent_context = Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ));
+        let span = tracing::info_span!("ollama_provider_test");
+        let _ = span.set_parent(parent_context);
+        let _guard = span.enter();
+
+        let response = provider
+            .complete(CompletionRequest {
+                model: String::new(),
+                system_prompt: Some("Answer plainly".into()),
+                messages: vec![Message {
+                    role: MessageRole::User,
+                    content: "Hello from Ollama".into(),
+                }],
+                tools: vec![],
+                response_schema: None,
+                session_id: Some("session-2".into()),
+                tool_choice: ToolChoice::Auto,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.provider, "ollama");
+        assert_eq!(response.model, "llama-test-model");
+        assert_eq!(response.text, "Hi from Ollama");
+
+        let captured = state.take_one();
+        let headers = captured.headers.into_iter().collect::<std::collections::HashMap<_, _>>();
+        if let Some(traceparent) = headers.get("traceparent") {
+            assert!(traceparent.starts_with("00-"));
+            assert!(!traceparent.trim().is_empty());
+        }
+
+        assert_eq!(captured.body["model"], "llama-test-model");
+        assert_eq!(captured.body["stream"], false);
+        assert_eq!(captured.body["messages"][0]["role"], "system");
+        assert_eq!(captured.body["messages"][0]["content"], "Answer plainly");
+        assert_eq!(captured.body["messages"][1]["role"], "user");
+        assert_eq!(captured.body["messages"][1]["content"], "Hello from Ollama");
+    }
+
+    #[tokio::test]
+    async fn ollama_config_reads_env() {
+        unsafe {
+            env::set_var("HARBOR_OLLAMA_BASE_URL", "http://ollama.example:11434");
+            env::set_var("HARBOR_OLLAMA_MODEL", "llama-env");
+        }
+
+        let config = OllamaConfig::from_env().unwrap();
+        assert_eq!(config.base_url, "http://ollama.example:11434");
+        assert_eq!(config.default_model, "llama-env");
+
+        unsafe {
+            env::remove_var("HARBOR_OLLAMA_BASE_URL");
+            env::remove_var("HARBOR_OLLAMA_MODEL");
+        }
+    }
+
+    async fn ollama_handler(
+        State(state): State<CaptureState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state.push(CapturedRequest {
+            headers: headers_to_vec(&headers),
+            body,
+        });
+
+        Json(json!({
+            "model": "llama-test-model",
+            "message": {
+                "role": "assistant",
+                "content": "Hi from Ollama"
+            },
+            "done": true
         }))
     }
 

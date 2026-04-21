@@ -6,6 +6,7 @@
 - mock provider
 - OpenAI-compatible provider client
 - Anthropic provider client
+- Ollama provider client
 - tool registry
 - session memory abstraction
 - agent runtime
@@ -15,10 +16,13 @@
 - env-first app/bootstrap config
 - MCP server builder
 - MCP local integration client
+- spawned MCP stdio client transport
+- MCP HTTP transport
 - HTTP ops surface with `/healthcheck`, `/readycheck`, and `/metrics`
 - request ID propagation via `x-request-id`
 - incoming trace-context extraction / parent span wiring
 - middleware-based request logging
+- timeout/auth/rate-limit middleware for app routes
 - tracing bootstrap
 - structured logging bootstrap
 - Prometheus recorder bootstrap
@@ -27,17 +31,14 @@
 
 ## Phase 2 - Runtime and ops
 - richer lifecycle hooks for background workers and subsystems
-- richer HTTP middleware stack (timeouts, auth hooks, rate limits)
 - OTEL log/metric exporter options
 - broader behavioral test coverage across crates
 
 ## Phase 3 - Richer AI integrations
-- Ollama / local model adapter
 - retry, timeout, and fallback policies
 - structured output helpers
 
 ## Phase 4 - Richer MCP support
-- stdio client for spawned MCP servers
 - resource and prompt endpoints
 - server capability negotiation helpers
 - richer auth/retry configuration for HTTP transport

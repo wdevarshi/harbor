@@ -7,8 +7,9 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
+use std::{env, process::Stdio};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -309,6 +310,122 @@ impl HttpClientTransport {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StdioClientConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl StdioClientConfig {
+    pub fn from_env() -> FrameworkResult<Self> {
+        let command = env::var("HARBOR_MCP_STDIO_COMMAND").map_err(|_| {
+            FrameworkError::Config(
+                "missing HARBOR_MCP_STDIO_COMMAND for spawned MCP stdio client".into(),
+            )
+        })?;
+
+        let args = env::var("HARBOR_MCP_STDIO_ARGS_JSON")
+            .ok()
+            .map(|value| serde_json::from_str::<Vec<String>>(&value))
+            .transpose()
+            .map_err(|error| FrameworkError::Config(error.to_string()))?
+            .unwrap_or_default();
+
+        Ok(Self { command, args })
+    }
+}
+
+pub struct SpawnedStdioClient {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
+
+impl SpawnedStdioClient {
+    pub async fn spawn(config: StdioClientConfig) -> FrameworkResult<Self> {
+        let mut child = Command::new(&config.command)
+            .args(&config.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| FrameworkError::Transport(error.to_string()))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| FrameworkError::Transport("failed to capture child stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| FrameworkError::Transport("failed to capture child stdout".into()))?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+
+    pub async fn spawn_from_env() -> FrameworkResult<Self> {
+        Self::spawn(StdioClientConfig::from_env()?).await
+    }
+
+    pub async fn initialize(&mut self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-init".into(),
+            method: "initialize".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn list_tools(&mut self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-tools-list".into(),
+            method: "tools/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn call_tool(&mut self, name: &str, arguments: JsonValue) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-tool-call".into(),
+            method: "tools/call".into(),
+            params: json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        })
+        .await
+    }
+
+    pub async fn shutdown(&mut self) -> FrameworkResult<()> {
+        if self.child.id().is_some() {
+            let _ = self.child.kill().await;
+        }
+        let _ = self.child.wait().await;
+        Ok(())
+    }
+
+    async fn send(&mut self, request: RpcRequest) -> FrameworkResult<JsonValue> {
+        let value = serde_json::to_value(&request)?;
+        write_stdio_message(&mut self.stdin, &value)
+            .await
+            .map_err(|error| FrameworkError::Transport(error.to_string()))?;
+
+        let response = read_stdio_message(&mut self.stdout)
+            .await
+            .map_err(|error| FrameworkError::Transport(error.to_string()))?
+            .ok_or_else(|| FrameworkError::Transport("spawned MCP stdio process closed stdout".into()))?;
+
+        serde_json::from_value::<RpcResponse>(response)
+            .map_err(|error| FrameworkError::Transport(error.to_string()))?
+            .into_result()
+    }
+}
+
 pub async fn write_stdio_message<W>(writer: &mut W, value: &JsonValue) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -505,6 +622,89 @@ mod tests {
         assert_eq!(rpc.id, "bad-1");
         assert!(rpc.result.is_none());
         assert!(rpc.error.unwrap().message.contains("unsupported method"));
+    }
+
+    #[tokio::test]
+    async fn spawned_stdio_client_calls_remote_process() {
+        let script = r#"
+import json, sys
+
+def read_message():
+    header = b''
+    while not header.endswith(b'\r\n\r\n'):
+        chunk = sys.stdin.buffer.read(1)
+        if not chunk:
+            return None
+        header += chunk
+    length = 0
+    for line in header.decode().split('\r\n'):
+        if line.lower().startswith('content-length:'):
+            length = int(line.split(':', 1)[1].strip())
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body.decode())
+
+def write_message(payload):
+    body = json.dumps(payload).encode()
+    header = f'Content-Length: {len(body)}\\r\\n\\r\\n'.encode()
+    sys.stdout.buffer.write(header)
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+payload = json.dumps({
+    'id': 'stdio-init',
+    'result': {'name': 'stdio-test-server'}
+}).encode()
+header = f'Content-Length: {len(payload)}\r\n\r\n'.encode()
+sys.stdout.buffer.write(header)
+sys.stdout.buffer.write(payload)
+sys.stdout.buffer.flush()
+"#;
+
+        let script_path = std::env::temp_dir().join(format!(
+            "harbor_mcp_stdio_test_{}.py",
+            std::process::id()
+        ));
+        std::fs::write(&script_path, script).unwrap();
+
+        let mut client = SpawnedStdioClient::spawn(StdioClientConfig {
+            command: "/usr/bin/python3".into(),
+            args: vec!["-u".into(), script_path.display().to_string()],
+        })
+        .await
+        .unwrap();
+
+        let init = tokio::time::timeout(std::time::Duration::from_secs(5), client.initialize())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(init["name"], "stdio-test-server");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn stdio_client_config_reads_env() {
+        unsafe {
+            env::set_var("HARBOR_MCP_STDIO_COMMAND", "/usr/bin/python3");
+            env::set_var(
+                "HARBOR_MCP_STDIO_ARGS_JSON",
+                "[\"-u\",\"-c\",\"print('hi')\"]",
+            );
+        }
+
+        let config = StdioClientConfig::from_env().unwrap();
+        assert_eq!(config.command, "/usr/bin/python3");
+        assert_eq!(config.args, vec!["-u", "-c", "print('hi')"]);
+
+        unsafe {
+            env::remove_var("HARBOR_MCP_STDIO_COMMAND");
+            env::remove_var("HARBOR_MCP_STDIO_ARGS_JSON");
+        }
     }
 
     async fn capturing_http_handler(

@@ -31,15 +31,18 @@ fn main() -> io::Result<()> {
             println!("- provider abstraction: available");
             println!("- OpenAI-compatible provider: available");
             println!("- Anthropic provider: available");
+            println!("- Ollama provider: available");
             println!("- agent runtime: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");
             println!("- MCP server primitives: available");
+            println!("- spawned MCP stdio client: available");
             println!("- MCP HTTP transport: available");
             println!("- MCP HTTP trace propagation: available");
             println!("- HTTP health/readiness surface: available");
             println!("- request ID propagation: available");
             println!("- request logging middleware: available");
+            println!("- HTTP timeout/auth/rate-limit middleware: available");
             println!("- tracing bootstrap: available");
             println!("- OTEL exporter bootstrap: available");
             println!("- trace-context extraction: available");

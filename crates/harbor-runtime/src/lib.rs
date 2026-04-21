@@ -1,6 +1,8 @@
 use harbor_ai::{CompletionRequest, CompletionResponse, Message, MessageRole, ModelProvider, ToolChoice};
 use harbor_core::{FrameworkError, FrameworkResult, ToolRegistry};
-use harbor_http::{HarborHttpConfig, HarborHttpServer, ReadinessGate};
+use harbor_http::{
+    HarborHttpConfig, HarborHttpMiddlewareConfig, HarborHttpServer, ReadinessGate,
+};
 use harbor_memory::{MemoryMessage, SessionMemory};
 use harbor_observability::{HarborObservability, HarborObservabilityConfig};
 use serde::{Deserialize, Serialize};
@@ -104,6 +106,11 @@ pub struct HarborAppConfig {
     pub metrics_enabled: bool,
     pub otel_enabled: bool,
     pub otel_endpoint: String,
+    pub http_timeout_ms: Option<u64>,
+    pub http_concurrency_limit: Option<usize>,
+    pub http_rate_limit_requests: Option<u64>,
+    pub http_rate_limit_window_secs: u64,
+    pub http_bearer_token: Option<String>,
 }
 
 impl Default for HarborAppConfig {
@@ -119,6 +126,11 @@ impl Default for HarborAppConfig {
             metrics_enabled: true,
             otel_enabled: false,
             otel_endpoint: "http://127.0.0.1:4317".into(),
+            http_timeout_ms: None,
+            http_concurrency_limit: None,
+            http_rate_limit_requests: None,
+            http_rate_limit_window_secs: 1,
+            http_bearer_token: None,
         }
     }
 }
@@ -169,6 +181,44 @@ impl HarborAppConfig {
             config.otel_endpoint = otel_endpoint;
         }
 
+        if let Ok(timeout_ms) = env::var("HARBOR_HTTP_TIMEOUT_MS") {
+            config.http_timeout_ms = Some(timeout_ms.parse().map_err(|error| {
+                FrameworkError::Config(format!("invalid HARBOR_HTTP_TIMEOUT_MS value: {error}"))
+            })?);
+        }
+
+        if let Ok(concurrency_limit) = env::var("HARBOR_HTTP_CONCURRENCY_LIMIT") {
+            config.http_concurrency_limit =
+                Some(concurrency_limit.parse().map_err(|error| {
+                    FrameworkError::Config(format!(
+                        "invalid HARBOR_HTTP_CONCURRENCY_LIMIT value: {error}"
+                    ))
+                })?);
+        }
+
+        if let Ok(rate_limit_requests) = env::var("HARBOR_HTTP_RATE_LIMIT_REQUESTS") {
+            config.http_rate_limit_requests =
+                Some(rate_limit_requests.parse().map_err(|error| {
+                    FrameworkError::Config(format!(
+                        "invalid HARBOR_HTTP_RATE_LIMIT_REQUESTS value: {error}"
+                    ))
+                })?);
+        }
+
+        if let Ok(rate_limit_window_secs) = env::var("HARBOR_HTTP_RATE_LIMIT_WINDOW_SECS") {
+            config.http_rate_limit_window_secs = rate_limit_window_secs.parse().map_err(|error| {
+                FrameworkError::Config(format!(
+                    "invalid HARBOR_HTTP_RATE_LIMIT_WINDOW_SECS value: {error}"
+                ))
+            })?;
+        }
+
+        if let Ok(http_bearer_token) = env::var("HARBOR_HTTP_BEARER_TOKEN") {
+            if !http_bearer_token.trim().is_empty() {
+                config.http_bearer_token = Some(http_bearer_token);
+            }
+        }
+
         Ok(config)
     }
 
@@ -192,6 +242,16 @@ impl HarborAppConfig {
             metrics_enabled: self.metrics_enabled,
             otel_enabled: self.otel_enabled,
             otel_endpoint: self.otel_endpoint.clone(),
+        }
+    }
+
+    pub fn http_middleware_config(&self) -> HarborHttpMiddlewareConfig {
+        HarborHttpMiddlewareConfig {
+            request_timeout_ms: self.http_timeout_ms,
+            concurrency_limit: self.http_concurrency_limit,
+            rate_limit_requests: self.http_rate_limit_requests,
+            rate_limit_window_secs: self.http_rate_limit_window_secs,
+            bearer_token: self.http_bearer_token.clone(),
         }
     }
 }
@@ -231,7 +291,9 @@ impl HarborApp {
     }
 
     pub fn http_server(&self) -> HarborHttpServer {
-        HarborHttpServer::new(self.config.http_config()).with_readiness(self.readiness.clone())
+        HarborHttpServer::new(self.config.http_config())
+            .with_readiness(self.readiness.clone())
+            .with_middleware_config(self.config.http_middleware_config())
     }
 
     pub async fn run(self) -> FrameworkResult<()> {

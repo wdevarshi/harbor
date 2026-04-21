@@ -25,6 +25,7 @@ Provider abstraction is intentionally separate from runtime so the framework can
 The current baseline includes:
 - OpenAI-compatible HTTP providers
 - Anthropic HTTP providers
+- Ollama HTTP providers
 
 Hosted HTTP providers can also inherit the current trace context so model/API calls participate in the same distributed trace when Harbor is running with OTEL enabled.
 
@@ -61,6 +62,7 @@ This keeps the framework from duplicating tool definitions between:
 The current MCP baseline includes:
 - in-process/local client usage
 - stdio framing for process-based transports
+- spawned stdio client transport for subprocess-backed MCP servers
 - HTTP transport for remote MCP-style integration
 - outbound trace-context injection for MCP HTTP client calls
 
@@ -72,6 +74,7 @@ The HTTP layer provides the operational surface around Harbor runtimes:
 - request ID propagation via `x-request-id`
 - incoming trace-context extraction from request headers
 - request logging middleware
+- timeout/auth/rate-limit middleware for application routes
 - env-driven bind configuration
 - graceful shutdown hooks
 

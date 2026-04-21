@@ -25,6 +25,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - mock provider for local development and tests
   - OpenAI-compatible provider client
   - Anthropic provider client
+  - Ollama provider client
   - outbound trace-context injection on provider HTTP calls
 - **`harbor-memory`**
   - session memory trait
@@ -40,6 +41,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - JSON-RPC + MCP-inspired protocol types
   - stdio framing (`Content-Length`)
   - MCP server builder
+  - spawned stdio client transport
   - HTTP transport for remote MCP integration
   - local + HTTP integration clients
   - outbound trace-context injection for MCP HTTP calls
@@ -48,6 +50,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - `/healthcheck`, `/readycheck`, and `/metrics`
   - request ID propagation via `x-request-id`
   - request logging middleware
+  - configurable timeout/auth/rate-limit middleware for app routes
   - env-driven HTTP config
   - graceful shutdown hook support
 - **`harbor-observability`**
@@ -121,6 +124,7 @@ This boots Harbor with:
 - request ID propagation via `x-request-id`
 - incoming `traceparent` extraction when OTEL is enabled
 - request logging middleware
+- optional timeout/auth/rate-limit middleware for app routes
 - signal-driven shutdown
 - env-driven tracing/logging + metrics bootstrap
 
@@ -149,7 +153,6 @@ GitHub Actions now runs:
 
 ## Near-term roadmap
 
-- Ollama provider adapter
 - typed tool schemas via derive macros
 - event streaming + observability hooks
 - vector memory backends
