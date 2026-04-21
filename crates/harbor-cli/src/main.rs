@@ -33,6 +33,7 @@ fn main() -> io::Result<()> {
             println!("- Anthropic provider: available");
             println!("- Ollama provider: available");
             println!("- provider retry/timeout/fallback helpers: available");
+            println!("- structured output helpers: available");
             println!("- agent runtime: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");

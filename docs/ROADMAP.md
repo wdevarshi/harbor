@@ -8,6 +8,7 @@
 - Anthropic provider client
 - Ollama provider client
 - provider retry / timeout / fallback helpers
+- structured output helpers
 - tool registry
 - session memory abstraction
 - agent runtime
@@ -36,7 +37,6 @@
 - broader behavioral test coverage across crates
 
 ## Phase 3 - Richer AI integrations
-- structured output helpers
 
 ## Phase 4 - Richer MCP support
 - resource and prompt endpoints

@@ -29,7 +29,7 @@ The current baseline includes:
 
 Hosted HTTP providers can also inherit the current trace context so model/API calls participate in the same distributed trace when Harbor is running with OTEL enabled.
 
-The provider layer also includes lightweight reliability wrappers for retry, timeout, and fallback behavior so apps can compose resilience without rewriting provider orchestration each time.
+The provider layer also includes lightweight reliability wrappers for retry, timeout, fallback, and structured-output parsing/validation so apps can compose resilience without rewriting provider orchestration each time.
 
 ### 2. Tools
 Tools are defined once and reused in:
