@@ -1,5 +1,5 @@
 [package]
-name = "mcpforge-runtime"
+name = "harbor-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,8 @@ description.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-mcpforge-core = { path = "../mcpforge-core" }
-mcpforge-ai = { path = "../mcpforge-ai" }
-mcpforge-memory = { path = "../mcpforge-memory" }
-
-[[example]]
-name = "hello_agent"
-path = "examples/hello_agent.rs"
+uuid.workspace = true

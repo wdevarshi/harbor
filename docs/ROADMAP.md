@@ -1,4 +1,4 @@
-# MCPForge Roadmap
+# Harbor Roadmap
 
 ## Phase 1 - Foundation (implemented in this scaffold)
 - workspace split into reusable crates

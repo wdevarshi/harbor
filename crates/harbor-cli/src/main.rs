@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::{fs, io, path::PathBuf};
 
 #[derive(Debug, Parser)]
-#[command(name = "mcpforge", about = "CLI for bootstrapping MCPForge projects")]
+#[command(name = "harbor", about = "CLI for bootstrapping Harbor projects")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -27,7 +27,7 @@ fn main() -> io::Result<()> {
             with_mcp_server,
         } => scaffold_project(&name, with_mcp_server),
         Commands::Doctor => {
-            println!("MCPForge doctor");
+            println!("Harbor doctor");
             println!("- provider abstraction: available");
             println!("- agent runtime: available");
             println!("- session memory: available");
@@ -58,9 +58,9 @@ serde_json = "1"
     )?;
 
     let main_rs = if with_mcp_server {
-        "fn main() {\n    println!(\"Hello from your MCPForge app with MCP server support\");\n}\n"
+        "fn main() {\n    println!(\"Hello from your Harbor app with MCP server support\");\n}\n"
     } else {
-        "fn main() {\n    println!(\"Hello from your MCPForge app\");\n}\n"
+        "fn main() {\n    println!(\"Hello from your Harbor app\");\n}\n"
     };
 
     fs::write(root.join("src/main.rs"), main_rs)?;

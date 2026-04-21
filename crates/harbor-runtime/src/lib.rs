@@ -1,6 +1,6 @@
-use mcpforge_ai::{CompletionRequest, CompletionResponse, Message, MessageRole, ModelProvider, ToolChoice};
-use mcpforge_core::{FrameworkResult, ToolRegistry};
-use mcpforge_memory::{MemoryMessage, SessionMemory};
+use harbor_ai::{CompletionRequest, CompletionResponse, Message, MessageRole, ModelProvider, ToolChoice};
+use harbor_core::{FrameworkResult, ToolRegistry};
+use harbor_memory::{MemoryMessage, SessionMemory};
 
 #[derive(Clone)]
 pub struct AgentRuntime<P, M> {
@@ -64,7 +64,7 @@ where
             .provider
             .complete(CompletionRequest {
                 model: self.default_model.clone(),
-                system_prompt: Some("You are MCPForge runtime".into()),
+                system_prompt: Some("You are Harbor runtime".into()),
                 messages,
                 tools: self.tools.list(),
                 response_schema: None,

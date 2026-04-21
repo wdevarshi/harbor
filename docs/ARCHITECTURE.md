@@ -1,8 +1,8 @@
-# MCPForge Architecture
+# Harbor Architecture
 
 ## Core idea
 
-MCPForge is a workspace of focused crates that compose into an AI application platform:
+Harbor is a workspace of focused crates that compose into an AI application platform:
 
 - **core**: shared primitives and tool contracts
 - **ai**: provider abstractions and model-facing types
@@ -53,7 +53,7 @@ This keeps the framework from duplicating tool definitions between:
 This design is meant to solve the most common AI framework failure mode:
 > every new AI solution reimplements providers, tools, memory, execution flow, and integrations from scratch.
 
-Instead, MCPForge gives one reusable substrate that can be adapted into:
+Instead, Harbor gives one reusable substrate that can be adapted into:
 - assistants
 - vertical AI apps
 - internal copilots

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use mcpforge_core::{FrameworkResult, JsonValue, Tool, ToolSpec};
-use mcpforge_mcp::{read_stdio_message, write_stdio_message, McpServerBuilder, RpcRequest};
+use harbor_core::{FrameworkResult, JsonValue, Tool, ToolSpec};
+use harbor_mcp::{read_stdio_message, write_stdio_message, McpServerBuilder, RpcRequest};
 use serde_json::json;
 use tokio::io::{stdin, stdout};
 

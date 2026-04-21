@@ -1,6 +1,6 @@
-# MCPForge
+# Harbor
 
-MCPForge is an **AI-first Rust framework** for building reusable AI solutions with **first-class MCP support**.
+Harbor is an **AI-first Rust framework** for building reusable AI solutions with **first-class MCP support**.
 
 It is inspired by modern AI application platforms and documentation patterns like the ones in Coldbrew Cloud: a single developer surface for
 - model providers
@@ -13,43 +13,43 @@ It is inspired by modern AI application platforms and documentation patterns lik
 
 ## What this v0.1 gives you
 
-- **`mcpforge-core`**
+- **`harbor-core`**
   - tool traits
   - tool registry
   - application blueprint/builder
   - shared framework errors
-- **`mcpforge-ai`**
+- **`harbor-ai`**
   - provider abstraction
   - chat/message types
   - structured completion request/response model
   - mock provider for local development and tests
-- **`mcpforge-memory`**
+- **`harbor-memory`**
   - session memory trait
   - in-memory implementation
-- **`mcpforge-runtime`**
+- **`harbor-runtime`**
   - agent runtime
   - workflow engine
   - reusable execution context
-- **`mcpforge-mcp`**
+- **`harbor-mcp`**
   - JSON-RPC + MCP-inspired protocol types
   - stdio framing (`Content-Length`)
   - MCP server builder
   - local integration client for tests and embedding
-- **`mcpforge-cli`**
+- **`harbor-cli`**
   - `new` command to scaffold a new AI solution
   - `doctor` command to explain workspace capabilities
 
 ## Workspace layout
 
 ```text
-mcpforge-rs/
+harbor/
   crates/
-    mcpforge-core/
-    mcpforge-ai/
-    mcpforge-memory/
-    mcpforge-runtime/
-    mcpforge-mcp/
-    mcpforge-cli/
+    harbor-core/
+    harbor-ai/
+    harbor-memory/
+    harbor-runtime/
+    harbor-mcp/
+    harbor-cli/
   docs/
     ARCHITECTURE.md
     ROADMAP.md
@@ -60,19 +60,19 @@ mcpforge-rs/
 ### Run the agent example
 
 ```bash
-cargo run -p mcpforge-runtime --example hello_agent
+cargo run -p harbor-runtime --example hello_agent
 ```
 
 ### Run the stdio MCP server example
 
 ```bash
-cargo run -p mcpforge-mcp --example echo_stdio_server
+cargo run -p harbor-mcp --example echo_stdio_server
 ```
 
 ### Scaffold a new project
 
 ```bash
-cargo run -p mcpforge-cli -- new my-ai-app --with-mcp-server
+cargo run -p harbor-cli -- new my-ai-app --with-mcp-server
 ```
 
 ## Design goals

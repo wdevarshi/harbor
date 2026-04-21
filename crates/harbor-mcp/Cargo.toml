@@ -1,5 +1,5 @@
 [package]
-name = "mcpforge-mcp"
+name = "harbor-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
-mcpforge-core = { path = "../mcpforge-core" }
+harbor-core = { path = "../harbor-core" }
 
 [[example]]
 name = "echo_stdio_server"

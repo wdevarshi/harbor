@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use mcpforge_core::{FrameworkResult, JsonValue, ToolSpec};
+use harbor_core::{FrameworkResult, JsonValue, ToolSpec};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +64,7 @@ impl ModelProvider for MockProvider {
             .messages
             .last()
             .map(|message| message.content.clone())
-            .unwrap_or_else(|| "Hello from MCPForge".to_string());
+            .unwrap_or_else(|| "Hello from Harbor".to_string());
 
         Ok(CompletionResponse {
             text: format!(

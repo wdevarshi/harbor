@@ -1,4 +1,4 @@
-use mcpforge_core::{FrameworkError, FrameworkResult, JsonValue, Tool, ToolRegistry};
+use harbor_core::{FrameworkError, FrameworkResult, JsonValue, Tool, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -87,7 +87,7 @@ impl McpServer {
     async fn handle_inner(&self, request: &RpcRequest) -> FrameworkResult<JsonValue> {
         match request.method.as_str() {
             "initialize" => Ok(json!({
-                "name": "mcpforge-server",
+                "name": "harbor-server",
                 "version": "0.1.0",
                 "capabilities": {
                     "tools": true
