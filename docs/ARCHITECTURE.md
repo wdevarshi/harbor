@@ -57,6 +57,8 @@ The HTTP layer provides the operational surface around Harbor runtimes:
 - `/healthcheck`
 - `/readycheck`
 - `/metrics`
+- request ID propagation via `x-request-id`
+- request logging middleware
 - env-driven bind configuration
 - graceful shutdown hooks
 
@@ -68,6 +70,7 @@ The observability layer bootstraps the global cross-cutting runtime concerns:
 - log level + JSON log configuration
 - Prometheus recorder initialization
 - metrics rendering into the HTTP surface
+- structured request logs emitted by the HTTP middleware
 
 ## Why this shape
 

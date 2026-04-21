@@ -42,6 +42,8 @@ It is inspired by modern AI application platforms and documentation patterns lik
 - **`harbor-http`**
   - Axum-based HTTP ops surface
   - `/healthcheck`, `/readycheck`, and `/metrics`
+  - request ID propagation via `x-request-id`
+  - request logging middleware
   - env-driven HTTP config
   - graceful shutdown hook support
 - **`harbor-observability`**
@@ -100,6 +102,8 @@ This boots Harbor with:
 - `/healthcheck`
 - `/readycheck`
 - `/metrics`
+- request ID propagation via `x-request-id`
+- request logging middleware
 - signal-driven shutdown
 - env-driven tracing/logging + metrics bootstrap
 

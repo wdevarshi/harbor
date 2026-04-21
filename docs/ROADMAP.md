@@ -15,6 +15,8 @@
 - MCP server builder
 - MCP local integration client
 - HTTP ops surface with `/healthcheck`, `/readycheck`, and `/metrics`
+- request ID propagation via `x-request-id`
+- middleware-based request logging
 - tracing bootstrap
 - structured logging bootstrap
 - Prometheus recorder bootstrap
@@ -22,9 +24,9 @@
 
 ## Phase 2 - Runtime and ops
 - richer lifecycle hooks for background workers and subsystems
-- request/trace ID propagation
+- trace ID propagation / OTEL context wiring
 - OTEL exporter bootstrap
-- middleware-based request logging
+- richer HTTP middleware stack (timeouts, auth hooks, rate limits)
 
 ## Phase 3 - Richer AI integrations
 - Anthropic adapter

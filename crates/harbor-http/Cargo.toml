@@ -12,6 +12,8 @@ axum.workspace = true
 metrics.workspace = true
 serde.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 harbor-core = { path = "../harbor-core" }
 
 [[example]]

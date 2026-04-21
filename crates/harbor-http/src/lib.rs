@@ -1,12 +1,13 @@
 use axum::{
-    extract::State,
-    http::{header, StatusCode},
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use harbor_core::{FrameworkError, FrameworkResult};
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -16,9 +17,13 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Instant,
 };
 use tokio::net::TcpListener;
+use tracing::info;
+use uuid::Uuid;
 
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub type MetricsRenderer = Arc<dyn Fn() -> String + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +117,11 @@ impl Default for ReadinessGate {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    pub request_id: String,
+}
+
 #[derive(Clone)]
 struct HarborHttpState {
     config: HarborHttpConfig,
@@ -128,15 +138,21 @@ pub fn router_with_metrics(
     readiness: ReadinessGate,
     metrics_renderer: Option<MetricsRenderer>,
 ) -> Router {
+    let state = HarborHttpState {
+        config,
+        readiness,
+        metrics_renderer,
+    };
+
     Router::new()
         .route("/healthcheck", get(healthcheck))
         .route("/readycheck", get(readycheck))
         .route("/metrics", get(metrics_endpoint))
-        .with_state(HarborHttpState {
-            config,
-            readiness,
-            metrics_renderer,
-        })
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_context_middleware,
+        ))
+        .with_state(state)
 }
 
 #[derive(Clone)]
@@ -195,14 +211,63 @@ impl HarborHttpServer {
     }
 }
 
-async fn healthcheck(State(state): State<HarborHttpState>) -> Json<ServiceStatusPayload> {
+async fn request_context_middleware(
+    State(state): State<HarborHttpState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request_id_from_headers(request.headers());
+    request
+        .extensions_mut()
+        .insert(RequestContext {
+            request_id: request_id.clone(),
+        });
+
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let started_at = Instant::now();
+
+    let mut response = next.run(request).await;
+    let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status().as_u16().to_string();
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+
     counter!(
         "harbor_http_requests_total",
-        "route" => "/healthcheck",
-        "status" => "200"
+        "route" => path.clone(),
+        "method" => method.clone(),
+        "status" => status.clone()
     )
     .increment(1);
 
+    histogram!(
+        "harbor_http_request_duration_ms",
+        "route" => path.clone(),
+        "method" => method.clone(),
+        "status" => status.clone()
+    )
+    .record(duration_ms);
+
+    info!(
+        service = %state.config.service_name.as_str(),
+        environment = %state.config.environment.as_str(),
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+        status = %status,
+        duration_ms = duration_ms,
+        "harbor http request"
+    );
+
+    response
+}
+
+async fn healthcheck(State(state): State<HarborHttpState>) -> Json<ServiceStatusPayload> {
     Json(ServiceStatusPayload::from_config(&state.config, "ok", None))
 }
 
@@ -213,15 +278,8 @@ async fn readycheck(State(state): State<HarborHttpState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let status_label = if ready { "200" } else { "503" };
 
     gauge!("harbor_ready_state").set(if ready { 1.0 } else { 0.0 });
-    counter!(
-        "harbor_http_requests_total",
-        "route" => "/readycheck",
-        "status" => status_label
-    )
-    .increment(1);
 
     let status = if ready { "ready" } else { "not_ready" };
 
@@ -237,36 +295,18 @@ async fn readycheck(State(state): State<HarborHttpState>) -> impl IntoResponse {
 
 async fn metrics_endpoint(State(state): State<HarborHttpState>) -> Response {
     match &state.metrics_renderer {
-        Some(render) => {
-            counter!(
-                "harbor_http_requests_total",
-                "route" => "/metrics",
-                "status" => "200"
-            )
-            .increment(1);
-
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-                render(),
-            )
-                .into_response()
-        }
-        None => {
-            counter!(
-                "harbor_http_requests_total",
-                "route" => "/metrics",
-                "status" => "404"
-            )
-            .increment(1);
-
-            (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                "metrics disabled\n",
-            )
-                .into_response()
-        }
+        Some(render) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            render(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "metrics disabled\n",
+        )
+            .into_response(),
     }
 }
 
@@ -294,4 +334,14 @@ impl ServiceStatusPayload {
             ready,
         }
     }
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
