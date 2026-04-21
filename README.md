@@ -72,6 +72,11 @@ harbor/
     ROADMAP.md
 ```
 
+## Requirements
+
+- Rust **1.86+**
+- `rust-toolchain.toml` is included so contributors land on a compatible toolchain by default
+
 ## Example usage
 
 ### Run the agent example
@@ -119,6 +124,12 @@ cargo run -p harbor-cli -- new my-ai-app --with-mcp-server
 2. **MCP-native**: easy to create MCP servers and integrate external MCP servers.
 3. **Reusable**: common building blocks for real AI products, not one-off demos.
 4. **Rust-first**: strongly typed, composable, and suitable for production-grade services.
+
+## CI
+
+GitHub Actions now runs:
+- `cargo check --workspace --all-targets`
+- `cargo test --workspace --no-run`
 
 ## Near-term roadmap
 
