@@ -46,6 +46,8 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - spawned stdio client transport
   - HTTP transport for remote MCP integration
   - local + HTTP integration clients
+  - resource + prompt endpoints
+  - capability reporting
   - outbound trace-context injection for MCP HTTP calls
 - **`harbor-http`**
   - Axum-based HTTP ops surface

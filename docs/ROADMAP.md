@@ -20,6 +20,8 @@
 - MCP local integration client
 - spawned MCP stdio client transport
 - MCP HTTP transport
+- MCP resource and prompt endpoints
+- MCP capability reporting
 - HTTP ops surface with `/healthcheck`, `/readycheck`, and `/metrics`
 - request ID propagation via `x-request-id`
 - incoming trace-context extraction / parent span wiring
@@ -39,8 +41,6 @@
 ## Phase 3 - Richer AI integrations
 
 ## Phase 4 - Richer MCP support
-- resource and prompt endpoints
-- server capability negotiation helpers
 - richer auth/retry configuration for HTTP transport
 
 ## Phase 5 - Developer ergonomics

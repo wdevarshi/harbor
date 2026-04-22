@@ -66,6 +66,8 @@ The current MCP baseline includes:
 - stdio framing for process-based transports
 - spawned stdio client transport for subprocess-backed MCP servers
 - HTTP transport for remote MCP-style integration
+- resource and prompt endpoints
+- capability reporting via `initialize`
 - outbound trace-context injection for MCP HTTP client calls
 
 ### 6. HTTP / ops

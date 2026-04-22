@@ -41,6 +41,7 @@ fn main() -> io::Result<()> {
             println!("- spawned MCP stdio client: available");
             println!("- MCP HTTP transport: available");
             println!("- MCP HTTP trace propagation: available");
+            println!("- MCP resources/prompts/capabilities: available");
             println!("- HTTP health/readiness surface: available");
             println!("- request ID propagation: available");
             println!("- request logging middleware: available");

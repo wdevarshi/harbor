@@ -1,4 +1,5 @@
-use axum::{extract::State, routing::post, Json, Router};
+use async_trait::async_trait;
+use axum::{routing::post, Json, Router};
 use harbor_core::{FrameworkError, FrameworkResult, JsonValue, Tool, ToolRegistry};
 use opentelemetry::{global, propagation::Injector};
 use reqwest::{
@@ -7,13 +8,24 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{env, process::Stdio};
+use std::{
+    collections::HashMap,
+    env,
+    future::Future,
+    pin::Pin,
+    process::Stdio,
+    sync::Arc,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub const DEFAULT_HTTP_PATH: &str = "/rpc";
+
+type JsonFuture = Pin<Box<dyn Future<Output = FrameworkResult<JsonValue>> + Send + 'static>>;
+type ResourceHandler = Arc<dyn Fn() -> JsonFuture + Send + Sync>;
+type PromptHandler = Arc<dyn Fn(JsonValue) -> JsonFuture + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
@@ -73,9 +85,173 @@ impl RpcResponse {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceSpec {
+    pub uri: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+impl ResourceSpec {
+    pub fn new(uri: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: name.into(),
+            description: None,
+            mime_type: None,
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn with_mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        self.mime_type = Some(mime_type.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptArgumentSpec {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub required: bool,
+}
+
+impl PromptArgumentSpec {
+    pub fn new(name: impl Into<String>, required: bool) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            required,
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptSpec {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<PromptArgumentSpec>,
+}
+
+impl PromptSpec {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: None,
+            arguments: Vec::new(),
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn with_argument(mut self, argument: PromptArgumentSpec) -> Self {
+        self.arguments.push(argument);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerCapabilities {
+    pub tools: bool,
+    pub resources: bool,
+    pub prompts: bool,
+}
+
+#[derive(Clone, Default)]
+struct ResourceRegistry {
+    specs: Vec<ResourceSpec>,
+    handlers: HashMap<String, ResourceHandler>,
+}
+
+impl ResourceRegistry {
+    fn register<F, Fut>(&mut self, spec: ResourceSpec, handler: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = FrameworkResult<JsonValue>> + Send + 'static,
+    {
+        self.specs.push(spec.clone());
+        self.handlers.insert(
+            spec.uri.clone(),
+            Arc::new(move || -> JsonFuture { Box::pin(handler()) }),
+        );
+    }
+
+    fn list(&self) -> Vec<ResourceSpec> {
+        self.specs.clone()
+    }
+
+    async fn read(&self, uri: &str) -> FrameworkResult<JsonValue> {
+        let handler = self
+            .handlers
+            .get(uri)
+            .ok_or_else(|| FrameworkError::Protocol(format!("resource not found: {uri}")))?;
+        handler().await
+    }
+
+    fn has_any(&self) -> bool {
+        !self.specs.is_empty()
+    }
+}
+
+#[derive(Clone, Default)]
+struct PromptRegistry {
+    specs: Vec<PromptSpec>,
+    handlers: HashMap<String, PromptHandler>,
+}
+
+impl PromptRegistry {
+    fn register<F, Fut>(&mut self, spec: PromptSpec, handler: F)
+    where
+        F: Fn(JsonValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = FrameworkResult<JsonValue>> + Send + 'static,
+    {
+        self.specs.push(spec.clone());
+        self.handlers.insert(
+            spec.name.clone(),
+            Arc::new(move |arguments| -> JsonFuture { Box::pin(handler(arguments)) }),
+        );
+    }
+
+    fn list(&self) -> Vec<PromptSpec> {
+        self.specs.clone()
+    }
+
+    async fn get(&self, name: &str, arguments: JsonValue) -> FrameworkResult<JsonValue> {
+        let handler = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| FrameworkError::Protocol(format!("prompt not found: {name}")))?;
+        handler(arguments).await
+    }
+
+    fn has_any(&self) -> bool {
+        !self.specs.is_empty()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct McpServerBuilder {
     tools: ToolRegistry,
+    resources: ResourceRegistry,
+    prompts: PromptRegistry,
 }
 
 impl McpServerBuilder {
@@ -88,14 +264,38 @@ impl McpServerBuilder {
         self
     }
 
+    pub fn resource<F, Fut>(mut self, spec: ResourceSpec, handler: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = FrameworkResult<JsonValue>> + Send + 'static,
+    {
+        self.resources.register(spec, handler);
+        self
+    }
+
+    pub fn prompt<F, Fut>(mut self, spec: PromptSpec, handler: F) -> Self
+    where
+        F: Fn(JsonValue) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = FrameworkResult<JsonValue>> + Send + 'static,
+    {
+        self.prompts.register(spec, handler);
+        self
+    }
+
     pub fn build(self) -> McpServer {
-        McpServer { tools: self.tools }
+        McpServer {
+            tools: self.tools,
+            resources: self.resources,
+            prompts: self.prompts,
+        }
     }
 }
 
 #[derive(Clone, Default)]
 pub struct McpServer {
     tools: ToolRegistry,
+    resources: ResourceRegistry,
+    prompts: PromptRegistry,
 }
 
 impl McpServer {
@@ -111,9 +311,7 @@ impl McpServer {
             "initialize" => Ok(json!({
                 "name": "harbor-server",
                 "version": "0.1.0",
-                "capabilities": {
-                    "tools": true
-                }
+                "capabilities": self.capabilities(),
             })),
             "tools/list" => Ok(json!({ "tools": self.tools.list() })),
             "tools/call" => {
@@ -129,24 +327,56 @@ impl McpServer {
                     .unwrap_or_else(default_params);
                 self.tools.call(name, arguments).await
             }
+            "resources/list" => Ok(json!({ "resources": self.resources.list() })),
+            "resources/read" => {
+                let uri = request
+                    .params
+                    .get("uri")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| FrameworkError::InvalidArguments("missing resource uri".into()))?;
+                self.resources.read(uri).await
+            }
+            "prompts/list" => Ok(json!({ "prompts": self.prompts.list() })),
+            "prompts/get" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| FrameworkError::InvalidArguments("missing prompt name".into()))?;
+                let arguments = request
+                    .params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(default_params);
+                self.prompts.get(name, arguments).await
+            }
             method => Err(FrameworkError::Protocol(format!(
                 "unsupported method: {method}"
             ))),
         }
     }
+
+    pub fn capabilities(&self) -> McpServerCapabilities {
+        McpServerCapabilities {
+            tools: !self.tools.list().is_empty(),
+            resources: self.resources.has_any(),
+            prompts: self.prompts.has_any(),
+        }
+    }
 }
 
 pub fn http_router(server: McpServer) -> Router {
-    Router::new()
-        .route(DEFAULT_HTTP_PATH, post(handle_http_rpc))
-        .with_state(server)
-}
-
-async fn handle_http_rpc(
-    State(server): State<McpServer>,
-    Json(request): Json<RpcRequest>,
-) -> Json<RpcResponse> {
-    Json(server.handle(request).await)
+    let server = Arc::new(server);
+    Router::new().route(
+        DEFAULT_HTTP_PATH,
+        post({
+            let server = server.clone();
+            move |Json(request): Json<RpcRequest>| {
+                let server = server.clone();
+                async move { Json(server.handle(request).await) }
+            }
+        }),
+    )
 }
 
 #[derive(Clone)]
@@ -160,39 +390,76 @@ impl LocalClient {
     }
 
     pub async fn initialize(&self) -> FrameworkResult<JsonValue> {
-        self.server
-            .handle(RpcRequest {
-                id: "local-init".into(),
-                method: "initialize".into(),
-                params: default_params(),
-            })
-            .await
-            .into_result()
+        self.send(RpcRequest {
+            id: "local-init".into(),
+            method: "initialize".into(),
+            params: default_params(),
+        })
+        .await
     }
 
     pub async fn list_tools(&self) -> FrameworkResult<JsonValue> {
-        self.server
-            .handle(RpcRequest {
-                id: "local-tools-list".into(),
-                method: "tools/list".into(),
-                params: default_params(),
-            })
-            .await
-            .into_result()
+        self.send(RpcRequest {
+            id: "local-tools-list".into(),
+            method: "tools/list".into(),
+            params: default_params(),
+        })
+        .await
     }
 
     pub async fn call_tool(&self, name: &str, arguments: JsonValue) -> FrameworkResult<JsonValue> {
-        self.server
-            .handle(RpcRequest {
-                id: "local-tool-call".into(),
-                method: "tools/call".into(),
-                params: json!({
-                    "name": name,
-                    "arguments": arguments,
-                }),
-            })
-            .await
-            .into_result()
+        self.send(RpcRequest {
+            id: "local-tool-call".into(),
+            method: "tools/call".into(),
+            params: json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        })
+        .await
+    }
+
+    pub async fn list_resources(&self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "local-resources-list".into(),
+            method: "resources/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "local-resource-read".into(),
+            method: "resources/read".into(),
+            params: json!({ "uri": uri }),
+        })
+        .await
+    }
+
+    pub async fn list_prompts(&self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "local-prompts-list".into(),
+            method: "prompts/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn get_prompt(&self, name: &str, arguments: JsonValue) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "local-prompt-get".into(),
+            method: "prompts/get".into(),
+            params: json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        })
+        .await
+    }
+
+    async fn send(&self, request: RpcRequest) -> FrameworkResult<JsonValue> {
+        self.server.handle(request).await.into_result()
     }
 }
 
@@ -279,6 +546,45 @@ impl HttpClientTransport {
         self.send(RpcRequest {
             id: "http-tool-call".into(),
             method: "tools/call".into(),
+            params: json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        })
+        .await
+    }
+
+    pub async fn list_resources(&self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "http-resources-list".into(),
+            method: "resources/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "http-resource-read".into(),
+            method: "resources/read".into(),
+            params: json!({ "uri": uri }),
+        })
+        .await
+    }
+
+    pub async fn list_prompts(&self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "http-prompts-list".into(),
+            method: "prompts/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn get_prompt(&self, name: &str, arguments: JsonValue) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "http-prompt-get".into(),
+            method: "prompts/get".into(),
             params: json!({
                 "name": name,
                 "arguments": arguments,
@@ -401,6 +707,45 @@ impl SpawnedStdioClient {
         .await
     }
 
+    pub async fn list_resources(&mut self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-resources-list".into(),
+            method: "resources/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn read_resource(&mut self, uri: &str) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-resource-read".into(),
+            method: "resources/read".into(),
+            params: json!({ "uri": uri }),
+        })
+        .await
+    }
+
+    pub async fn list_prompts(&mut self) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-prompts-list".into(),
+            method: "prompts/list".into(),
+            params: default_params(),
+        })
+        .await
+    }
+
+    pub async fn get_prompt(&mut self, name: &str, arguments: JsonValue) -> FrameworkResult<JsonValue> {
+        self.send(RpcRequest {
+            id: "stdio-prompt-get".into(),
+            method: "prompts/get".into(),
+            params: json!({
+                "name": name,
+                "arguments": arguments,
+            }),
+        })
+        .await
+    }
+
     pub async fn shutdown(&mut self) -> FrameworkResult<()> {
         if self.child.id().is_some() {
             let _ = self.child.kill().await;
@@ -418,7 +763,9 @@ impl SpawnedStdioClient {
         let response = read_stdio_message(&mut self.stdout)
             .await
             .map_err(|error| FrameworkError::Transport(error.to_string()))?
-            .ok_or_else(|| FrameworkError::Transport("spawned MCP stdio process closed stdout".into()))?;
+            .ok_or_else(|| {
+                FrameworkError::Transport("spawned MCP stdio process closed stdout".into())
+            })?;
 
         serde_json::from_value::<RpcResponse>(response)
             .map_err(|error| FrameworkError::Transport(error.to_string()))?
@@ -508,16 +855,9 @@ impl Injector for HeaderInjector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use axum::{extract::State, http::HeaderMap as AxumHeaderMap};
-    use opentelemetry::{
-        global,
-        trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
-        Context,
-    };
-    use opentelemetry_sdk::propagation::TraceContextPropagator;
-    use std::sync::{Arc, Mutex};
-    use tokio::net::TcpListener;
+    use std::sync::Mutex;
+    use tokio::{net::TcpListener, time::timeout};
 
     #[derive(Clone, Default)]
     struct CaptureState {
@@ -555,11 +895,49 @@ mod tests {
         }
     }
 
+    fn build_test_server() -> McpServer {
+        McpServerBuilder::new()
+            .tool(EchoTool)
+            .resource(
+                ResourceSpec::new("harbor://docs/getting-started", "Getting Started")
+                    .with_description("Starter guide")
+                    .with_mime_type("text/markdown"),
+                || async {
+                    Ok(json!({
+                        "uri": "harbor://docs/getting-started",
+                        "mimeType": "text/markdown",
+                        "contents": "# Harbor\nStart here."
+                    }))
+                },
+            )
+            .prompt(
+                PromptSpec::new("welcome")
+                    .with_description("Build a welcome prompt")
+                    .with_argument(
+                        PromptArgumentSpec::new("name", true).with_description("User name"),
+                    ),
+                |arguments| async move {
+                    let name = arguments
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("friend")
+                        .to_string();
+                    Ok(json!({
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": format!("Welcome, {}", name)
+                            }
+                        ]
+                    }))
+                },
+            )
+            .build()
+    }
+
     #[tokio::test]
     async fn http_client_transport_calls_remote_mcp_and_injects_trace_context() {
-        global::set_text_map_propagator(TraceContextPropagator::new());
-
-        let server = McpServerBuilder::new().tool(EchoTool).build();
+        let server = build_test_server();
         let state = TestState {
             server,
             capture: CaptureState::default(),
@@ -574,28 +952,43 @@ mod tests {
             path: DEFAULT_HTTP_PATH.into(),
         });
 
-        let parent_context = Context::new().with_remote_span_context(SpanContext::new(
-            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
-            SpanId::from_hex("00f067aa0ba902b7").unwrap(),
-            TraceFlags::SAMPLED,
-            true,
-            TraceState::default(),
-        ));
-        let span = tracing::info_span!("mcp_http_client_test");
-        let _ = span.set_parent(parent_context);
-        let _guard = span.enter();
-
         let init = client.initialize().await.unwrap();
         assert_eq!(init["name"], "harbor-server");
+        assert_eq!(init["capabilities"]["tools"], true);
+        assert_eq!(init["capabilities"]["resources"], true);
+        assert_eq!(init["capabilities"]["prompts"], true);
 
         let tools = client.list_tools().await.unwrap();
         assert_eq!(tools["tools"][0]["name"], "echo");
 
-        let called = client.call_tool("echo", json!({ "text": "hello mcp" })).await.unwrap();
+        let resources = client.list_resources().await.unwrap();
+        assert_eq!(resources["resources"][0]["uri"], "harbor://docs/getting-started");
+
+        let resource = client
+            .read_resource("harbor://docs/getting-started")
+            .await
+            .unwrap();
+        assert_eq!(resource["mimeType"], "text/markdown");
+
+        let prompts = client.list_prompts().await.unwrap();
+        assert_eq!(prompts["prompts"][0]["name"], "welcome");
+
+        let prompt = client
+            .get_prompt("welcome", json!({ "name": "Devarshi" }))
+            .await
+            .unwrap();
+        assert_eq!(prompt["messages"][0]["content"], "Welcome, Devarshi");
+
+        let called = client
+            .call_tool("echo", json!({ "text": "hello mcp" }))
+            .await
+            .unwrap();
         assert_eq!(called["echo"], "hello mcp");
 
         let headers = state.capture.headers.lock().unwrap().clone();
-        let headers = headers.into_iter().collect::<std::collections::HashMap<_, _>>();
+        let headers = headers
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
         if let Some(traceparent) = headers.get("traceparent") {
             assert!(traceparent.starts_with("00-"));
         }
@@ -603,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_router_returns_rpc_error_for_unknown_method() {
-        let server = McpServerBuilder::new().tool(EchoTool).build();
+        let server = build_test_server();
         let base_url = spawn_router(http_router(server)).await;
 
         let response = reqwest::Client::new()
@@ -643,21 +1036,16 @@ def read_message():
     body = sys.stdin.buffer.read(length)
     return json.loads(body.decode())
 
-def write_message(payload):
-    body = json.dumps(payload).encode()
-    header = f'Content-Length: {len(body)}\\r\\n\\r\\n'.encode()
+message = read_message()
+if message is not None:
+    payload = json.dumps({
+        'id': message['id'],
+        'result': {'name': 'stdio-test-server'}
+    }).encode()
+    header = f'Content-Length: {len(payload)}\r\n\r\n'.encode()
     sys.stdout.buffer.write(header)
-    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.write(payload)
     sys.stdout.buffer.flush()
-
-payload = json.dumps({
-    'id': 'stdio-init',
-    'result': {'name': 'stdio-test-server'}
-}).encode()
-header = f'Content-Length: {len(payload)}\r\n\r\n'.encode()
-sys.stdout.buffer.write(header)
-sys.stdout.buffer.write(payload)
-sys.stdout.buffer.flush()
 "#;
 
         let script_path = std::env::temp_dir().join(format!(
@@ -673,13 +1061,13 @@ sys.stdout.buffer.flush()
         .await
         .unwrap();
 
-        let init = tokio::time::timeout(std::time::Duration::from_secs(5), client.initialize())
+        let init = timeout(std::time::Duration::from_secs(5), client.initialize())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(init["name"], "stdio-test-server");
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), client.shutdown())
+        timeout(std::time::Duration::from_secs(5), client.shutdown())
             .await
             .unwrap()
             .unwrap();
