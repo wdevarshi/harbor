@@ -23,5 +23,9 @@ name = "hello_agent"
 path = "examples/hello_agent.rs"
 
 [[example]]
+name = "streaming_agent"
+path = "examples/streaming_agent.rs"
+
+[[example]]
 name = "bootstrap_http"
 path = "examples/bootstrap_http.rs"

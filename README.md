@@ -22,6 +22,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - provider abstraction
   - chat/message types
   - structured completion request/response model
+  - provider event streaming hooks
   - mock provider for local development and tests
   - OpenAI-compatible provider client
   - Anthropic provider client
@@ -34,6 +35,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - in-memory implementation
 - **`harbor-runtime`**
   - agent runtime
+  - streaming turn API
   - workflow engine
   - reusable execution context
   - shared `HarborApp` bootstrap entrypoint
@@ -97,6 +99,12 @@ harbor/
 cargo run -p harbor-runtime --example hello_agent
 ```
 
+### Run the streaming agent example
+
+```bash
+cargo run -p harbor-runtime --example streaming_agent
+```
+
 ### Run the stdio MCP server example
 
 ```bash
@@ -158,6 +166,7 @@ GitHub Actions now runs:
 ## Near-term roadmap
 
 - typed tool schemas via derive macros
-- event streaming + observability hooks
+- native provider-specific streaming adapters
+- richer observability hooks
 - vector memory backends
 - deployment templates for containerized AI services

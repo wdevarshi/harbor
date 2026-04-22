@@ -6,9 +6,9 @@ Harbor is a workspace of focused crates that compose into an AI application plat
 
 - **core**: shared primitives and tool contracts
   - typed schema helpers for tool contracts
-- **ai**: provider abstractions and model-facing types
+- **ai**: provider abstractions, model-facing types, and event streaming hooks
 - **memory**: session and state retention
-- **runtime**: agents and workflows
+- **runtime**: agents, workflows, and streaming turn orchestration
 - **mcp**: MCP server/client protocol and transports
 - **http**: health/readiness/metrics and ops-facing HTTP surface
 - **observability**: tracing/log bootstrap and Prometheus setup
@@ -30,7 +30,7 @@ The current baseline includes:
 
 Hosted HTTP providers can also inherit the current trace context so model/API calls participate in the same distributed trace when Harbor is running with OTEL enabled.
 
-The provider layer also includes lightweight reliability wrappers for retry, timeout, fallback, and structured-output parsing/validation so apps can compose resilience without rewriting provider orchestration each time.
+The provider layer also includes lightweight reliability wrappers for retry, timeout, fallback, structured-output parsing/validation, and a generic completion event stream (`started` / `delta` / `finished`) so apps can compose resilience and incremental output without rewriting provider orchestration each time.
 
 ### 2. Tools
 Tools are defined once and reused in:
@@ -51,6 +51,7 @@ Runtime orchestrates:
 - prompt/system state
 - memory loading
 - provider invocation
+- streaming turn execution
 - tool registry access
 - workflow state transitions
 - shared application bootstrap (`HarborApp`)

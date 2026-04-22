@@ -7,6 +7,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::{env, sync::Arc, time::Duration};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::time::{sleep, timeout};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -83,10 +84,53 @@ pub struct CompletionResponse {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CompletionEvent {
+    Started { provider: String, model: String },
+    Delta { text: String },
+    Finished { response: CompletionResponse },
+}
+
+pub struct CompletionEventStream {
+    receiver: UnboundedReceiver<FrameworkResult<CompletionEvent>>,
+}
+
+impl CompletionEventStream {
+    pub fn from_response(response: CompletionResponse) -> Self {
+        let (sender, receiver) = unbounded_channel();
+        let _ = sender.send(Ok(CompletionEvent::Started {
+            provider: response.provider.clone(),
+            model: response.model.clone(),
+        }));
+
+        for chunk in split_stream_chunks(&response.text) {
+            let _ = sender.send(Ok(CompletionEvent::Delta { text: chunk }));
+        }
+
+        let _ = sender.send(Ok(CompletionEvent::Finished { response }));
+        drop(sender);
+
+        Self { receiver }
+    }
+
+    pub async fn recv(&mut self) -> Option<FrameworkResult<CompletionEvent>> {
+        self.receiver.recv().await
+    }
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &'static str;
     async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse>;
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        let response = self.complete(request).await?;
+        Ok(CompletionEventStream::from_response(response))
+    }
 }
 
 pub type SharedProvider = Arc<dyn ModelProvider>;
@@ -268,7 +312,10 @@ where
         self.inner.name()
     }
 
-    async fn complete(&self, mut request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+    async fn complete(
+        &self,
+        mut request: CompletionRequest,
+    ) -> FrameworkResult<CompletionResponse> {
         let schema = request.response_schema.clone();
         if let Some(schema) = &schema {
             let schema_text = serde_json::to_string_pretty(schema)?;
@@ -347,7 +394,9 @@ pub fn validate_json_schema(schema: &JsonValue, value: &JsonValue) -> FrameworkR
                     }
                 }
 
-                if let Some(properties) = schema.get("properties").and_then(|value| value.as_object()) {
+                if let Some(properties) =
+                    schema.get("properties").and_then(|value| value.as_object())
+                {
                     for (key, property_schema) in properties {
                         if let Some(property_value) = object.get(key) {
                             validate_json_schema(property_schema, property_value)?;
@@ -406,12 +455,14 @@ fn extract_json_from_fence(text: &str) -> Option<FrameworkResult<JsonValue>> {
         None => rest,
     };
     let end = after_language.find("```")?;
-    Some(
-        serde_json::from_str::<JsonValue>(after_language[..end].trim()).map_err(Into::into),
-    )
+    Some(serde_json::from_str::<JsonValue>(after_language[..end].trim()).map_err(Into::into))
 }
 
-fn extract_balanced_json(text: &str, open: char, close: char) -> Option<FrameworkResult<JsonValue>> {
+fn extract_balanced_json(
+    text: &str,
+    open: char,
+    close: char,
+) -> Option<FrameworkResult<JsonValue>> {
     let start = text.find(open)?;
     let mut depth = 0usize;
     let mut in_string = false;
@@ -701,10 +752,13 @@ impl ModelProvider for AnthropicProvider {
         let api_messages = messages
             .into_iter()
             .filter_map(|message| {
-                message.role.as_anthropic_role().map(|role| AnthropicMessageRequest {
-                    role: role.into(),
-                    content: vec![AnthropicContentBlockRequest::text(message.content)],
-                })
+                message
+                    .role
+                    .as_anthropic_role()
+                    .map(|role| AnthropicMessageRequest {
+                        role: role.into(),
+                        content: vec![AnthropicContentBlockRequest::text(message.content)],
+                    })
             })
             .collect::<Vec<_>>();
 
@@ -722,7 +776,10 @@ impl ModelProvider for AnthropicProvider {
 
         let response = self
             .client
-            .post(format!("{}/messages", self.config.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/messages",
+                self.config.base_url.trim_end_matches('/')
+            ))
             .headers(headers)
             .json(&AnthropicMessagesRequest {
                 model: model.clone(),
@@ -845,7 +902,10 @@ impl ModelProvider for OllamaProvider {
 
         let response = self
             .client
-            .post(format!("{}/api/chat", self.config.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/api/chat",
+                self.config.base_url.trim_end_matches('/')
+            ))
             .headers(headers)
             .json(&OllamaChatRequest {
                 model: model.clone(),
@@ -872,7 +932,11 @@ impl ModelProvider for OllamaProvider {
                     Some(message.content)
                 }
             })
-            .ok_or_else(|| FrameworkError::Provider("Ollama provider returned no assistant text response".into()))?;
+            .ok_or_else(|| {
+                FrameworkError::Provider(
+                    "Ollama provider returned no assistant text response".into(),
+                )
+            })?;
 
         Ok(CompletionResponse {
             text,
@@ -997,6 +1061,18 @@ fn inject_trace_context(headers: &mut HeaderMap) {
     });
 }
 
+fn split_stream_chunks(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    chars
+        .chunks(16)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
 struct HeaderInjector<'a>(&'a mut HeaderMap);
 
 impl Injector for HeaderInjector<'_> {
@@ -1014,11 +1090,7 @@ impl Injector for HeaderInjector<'_> {
 mod tests {
     use super::*;
     use axum::{
-        extract::State,
-        http::HeaderMap,
-        response::IntoResponse,
-        routing::post,
-        Json, Router,
+        extract::State, http::HeaderMap, response::IntoResponse, routing::post, Json, Router,
     };
     use opentelemetry::{
         global,
@@ -1027,7 +1099,10 @@ mod tests {
     };
     use opentelemetry_sdk::propagation::TraceContextPropagator;
     use serde_json::{json, Value};
-    use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
     use tokio::net::TcpListener;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -1049,7 +1124,10 @@ mod tests {
             self.provider_name
         }
 
-        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> FrameworkResult<CompletionResponse> {
             self.capture
                 .system_prompts
                 .lock()
@@ -1077,7 +1155,10 @@ mod tests {
             self.provider_name
         }
 
-        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> FrameworkResult<CompletionResponse> {
             Ok(CompletionResponse {
                 text: self.text.clone(),
                 structured: None,
@@ -1100,7 +1181,10 @@ mod tests {
             self.provider_name
         }
 
-        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> FrameworkResult<CompletionResponse> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if call <= self.failures_before_success {
                 Err(FrameworkError::Provider(format!(
@@ -1130,7 +1214,10 @@ mod tests {
             self.provider_name
         }
 
-        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> FrameworkResult<CompletionResponse> {
             tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             Ok(CompletionResponse {
                 text: format!("{} done", self.provider_name),
@@ -1212,8 +1299,7 @@ mod tests {
 
     #[test]
     fn extract_json_value_finds_json_inside_code_fence() {
-        let value = extract_json_value("Here you go:\n```json\n{\"answer\":\"hi\"}\n```")
-            .unwrap();
+        let value = extract_json_value("Here you go:\n```json\n{\"answer\":\"hi\"}\n```").unwrap();
         assert_eq!(value["answer"], "hi");
     }
 
@@ -1228,7 +1314,74 @@ mod tests {
         });
 
         let error = validate_json_schema(&schema, &json!({ "other": "x" })).unwrap_err();
-        assert!(error.to_string().contains("missing required field 'answer'"));
+        assert!(error
+            .to_string()
+            .contains("missing required field 'answer'"));
+    }
+
+    #[tokio::test]
+    async fn completion_event_stream_emits_started_delta_and_finished() {
+        let response = CompletionResponse {
+            text: "stream me please".into(),
+            structured: None,
+            provider: "mock".into(),
+            model: "mock-model".into(),
+        };
+        let expected_text = response.text.clone();
+
+        let mut stream = CompletionEventStream::from_response(response.clone());
+        let mut saw_started = false;
+        let mut deltas = String::new();
+        let mut finished = None;
+
+        while let Some(event) = stream.recv().await {
+            match event.unwrap() {
+                CompletionEvent::Started { provider, model } => {
+                    saw_started = true;
+                    assert_eq!(provider, "mock");
+                    assert_eq!(model, "mock-model");
+                }
+                CompletionEvent::Delta { text } => deltas.push_str(&text),
+                CompletionEvent::Finished { response } => finished = Some(response),
+            }
+        }
+
+        assert!(saw_started);
+        assert_eq!(deltas, expected_text);
+        assert_eq!(finished.unwrap().text, response.text);
+    }
+
+    #[tokio::test]
+    async fn default_complete_stream_uses_complete_response() {
+        let provider = StaticProvider {
+            provider_name: "static",
+            text: "hello from stream".into(),
+        };
+
+        let mut stream = provider.complete_stream(sample_request()).await.unwrap();
+        let mut saw_started = false;
+        let mut deltas = String::new();
+        let mut finished = None;
+
+        while let Some(event) = stream.recv().await {
+            match event.unwrap() {
+                CompletionEvent::Started { provider, model } => {
+                    saw_started = true;
+                    assert_eq!(provider, "static");
+                    assert_eq!(model, "test-model");
+                }
+                CompletionEvent::Delta { text } => deltas.push_str(&text),
+                CompletionEvent::Finished { response } => finished = Some(response),
+            }
+        }
+
+        assert!(saw_started);
+        assert_eq!(deltas, "hello from stream");
+
+        let finished = finished.unwrap();
+        assert_eq!(finished.provider, "static");
+        assert_eq!(finished.model, "test-model");
+        assert_eq!(finished.text, "hello from stream");
     }
 
     #[tokio::test]
@@ -1298,7 +1451,9 @@ mod tests {
         global::set_text_map_propagator(TraceContextPropagator::new());
 
         let state = CaptureState::default();
-        let app = Router::new().route("/messages", post(anthropic_handler)).with_state(state.clone());
+        let app = Router::new()
+            .route("/messages", post(anthropic_handler))
+            .with_state(state.clone());
         let base_url = spawn_router(app).await;
 
         let provider = AnthropicProvider::new(AnthropicConfig {
@@ -1340,7 +1495,10 @@ mod tests {
         assert_eq!(response.text, "Hi from Anthropic");
 
         let captured = state.take_one();
-        let headers = captured.headers.into_iter().collect::<std::collections::HashMap<_, _>>();
+        let headers = captured
+            .headers
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(headers.get("x-api-key").unwrap(), "anthropic-test-key");
         assert_eq!(headers.get("anthropic-version").unwrap(), ANTHROPIC_VERSION);
         if let Some(traceparent) = headers.get("traceparent") {
@@ -1353,7 +1511,10 @@ mod tests {
         assert_eq!(captured.body["max_tokens"], 256);
         assert_eq!(captured.body["messages"][0]["role"], "user");
         assert_eq!(captured.body["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(captured.body["messages"][0]["content"][0]["text"], "Hello from Harbor");
+        assert_eq!(
+            captured.body["messages"][0]["content"][0]["text"],
+            "Hello from Harbor"
+        );
     }
 
     #[tokio::test]
@@ -1402,7 +1563,9 @@ mod tests {
         global::set_text_map_propagator(TraceContextPropagator::new());
 
         let state = CaptureState::default();
-        let app = Router::new().route("/api/chat", post(ollama_handler)).with_state(state.clone());
+        let app = Router::new()
+            .route("/api/chat", post(ollama_handler))
+            .with_state(state.clone());
         let base_url = spawn_router(app).await;
 
         let provider = OllamaProvider::new(OllamaConfig {
@@ -1442,7 +1605,10 @@ mod tests {
         assert_eq!(response.text, "Hi from Ollama");
 
         let captured = state.take_one();
-        let headers = captured.headers.into_iter().collect::<std::collections::HashMap<_, _>>();
+        let headers = captured
+            .headers
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
         if let Some(traceparent) = headers.get("traceparent") {
             assert!(traceparent.starts_with("00-"));
             assert!(!traceparent.trim().is_empty());
@@ -1505,7 +1671,12 @@ mod tests {
     fn headers_to_vec(headers: &HeaderMap) -> Vec<(String, String)> {
         headers
             .iter()
-            .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.to_string(), value.to_string())))
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.to_string(), value.to_string()))
+            })
             .collect()
     }
 }
