@@ -5,6 +5,7 @@
 Harbor is a workspace of focused crates that compose into an AI application platform:
 
 - **core**: shared primitives and tool contracts
+  - typed schema helpers for tool contracts
 - **ai**: provider abstractions and model-facing types
 - **memory**: session and state retention
 - **runtime**: agents and workflows

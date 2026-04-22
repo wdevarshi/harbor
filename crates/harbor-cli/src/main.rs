@@ -34,6 +34,7 @@ fn main() -> io::Result<()> {
             println!("- Ollama provider: available");
             println!("- provider retry/timeout/fallback helpers: available");
             println!("- structured output helpers: available");
+            println!("- typed schema helpers: available");
             println!("- agent runtime: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");

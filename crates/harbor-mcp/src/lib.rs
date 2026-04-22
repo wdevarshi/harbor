@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use axum::{routing::post, Json, Router};
-use harbor_core::{FrameworkError, FrameworkResult, JsonValue, Tool, ToolRegistry};
+use harbor_core::{typed_tool_spec, FrameworkError, FrameworkResult, JsonValue, Schema, Tool, ToolRegistry, ToolSpec, TypedSchema};
 use opentelemetry::{global, propagation::Injector};
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -872,20 +872,25 @@ mod tests {
 
     struct EchoTool;
 
+    struct EchoInputSchema;
+
+    impl TypedSchema for EchoInputSchema {
+        fn schema() -> JsonValue {
+            Schema::object()
+                .required_property(
+                    "text",
+                    Schema::string().with_description("Text to echo back"),
+                )
+                .additional_properties(false)
+                .build()
+                .into_json()
+        }
+    }
+
     #[async_trait]
     impl Tool for EchoTool {
-        fn spec(&self) -> harbor_core::ToolSpec {
-            harbor_core::ToolSpec::new(
-                "echo",
-                "Echo text back",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "text": { "type": "string" }
-                    },
-                    "required": ["text"]
-                }),
-            )
+        fn spec(&self) -> ToolSpec {
+            typed_tool_spec::<EchoInputSchema>("echo", "Echo text back")
         }
 
         async fn call(&self, args: JsonValue) -> FrameworkResult<JsonValue> {

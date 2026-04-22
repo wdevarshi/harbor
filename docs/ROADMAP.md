@@ -8,6 +8,7 @@
 - Anthropic provider client
 - Ollama provider client
 - provider retry / timeout / fallback helpers
+- typed schema helpers for tool definitions
 - structured output helpers
 - tool registry
 - session memory abstraction

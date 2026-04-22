@@ -159,3 +159,6 @@ impl AppBlueprintBuilder {
         }
     }
 }
+
+pub mod schema;
+pub use schema::*;

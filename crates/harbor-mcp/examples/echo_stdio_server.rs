@@ -1,25 +1,30 @@
 use async_trait::async_trait;
-use harbor_core::{FrameworkResult, JsonValue, Tool, ToolSpec};
+use harbor_core::{typed_tool_spec, FrameworkResult, JsonValue, Schema, Tool, ToolSpec, TypedSchema};
 use harbor_mcp::{read_stdio_message, write_stdio_message, McpServerBuilder, RpcRequest};
 use serde_json::json;
 use tokio::io::{stdin, stdout};
 
 struct EchoTool;
 
+struct EchoInputSchema;
+
+impl TypedSchema for EchoInputSchema {
+    fn schema() -> JsonValue {
+        Schema::object()
+            .required_property(
+                "text",
+                Schema::string().with_description("Text to echo back"),
+            )
+            .additional_properties(false)
+            .build()
+            .into_json()
+    }
+}
+
 #[async_trait]
 impl Tool for EchoTool {
     fn spec(&self) -> ToolSpec {
-        ToolSpec::new(
-            "echo",
-            "Echo back the provided text",
-            json!({
-                "type": "object",
-                "properties": {
-                    "text": { "type": "string" }
-                },
-                "required": ["text"]
-            }),
-        )
+        typed_tool_spec::<EchoInputSchema>("echo", "Echo back the provided text")
     }
 
     async fn call(&self, args: JsonValue) -> FrameworkResult<JsonValue> {
