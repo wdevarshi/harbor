@@ -36,9 +36,14 @@ fn main() -> io::Result<()> {
             println!("- structured output helpers: available");
             println!("- typed schema helpers: available");
             println!("- provider/runtime event streaming: available");
+            println!("- native OpenAI-compatible/Ollama streaming: available");
             println!("- agent runtime: available");
+            println!("- lifecycle task primitives: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");
+            println!("- file-backed session memory: available");
+            println!("- document store + lexical retrieval: available");
+            println!("- prompt injection helpers: available");
             println!("- MCP server primitives: available");
             println!("- spawned MCP stdio client: available");
             println!("- MCP HTTP transport: available");

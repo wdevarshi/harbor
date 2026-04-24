@@ -8,15 +8,18 @@ description.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 harbor-core = { path = "../harbor-core" }
 harbor-ai = { path = "../harbor-ai" }
 harbor-http = { path = "../harbor-http" }
 harbor-memory = { path = "../harbor-memory" }
 harbor-observability = { path = "../harbor-observability" }
+harbor-rag = { path = "../harbor-rag" }
 
 [[example]]
 name = "hello_agent"
@@ -25,6 +28,10 @@ path = "examples/hello_agent.rs"
 [[example]]
 name = "streaming_agent"
 path = "examples/streaming_agent.rs"
+
+[[example]]
+name = "retrieval_agent"
+path = "examples/retrieval_agent.rs"
 
 [[example]]
 name = "bootstrap_http"

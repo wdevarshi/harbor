@@ -33,9 +33,19 @@ It is inspired by modern AI application platforms and documentation patterns lik
 - **`harbor-memory`**
   - session memory trait
   - in-memory implementation
+  - file-backed persistent session memory
+- **`harbor-rag`**
+  - document store abstraction
+  - in-memory + file-backed document stores
+  - document chunking helpers
+  - lexical retrieval
+  - prompt injection helpers for retrieved context
 - **`harbor-runtime`**
   - agent runtime
   - streaming turn API
+  - retrieval-aware turn execution
+  - lifecycle task primitives
+  - in-memory + file-backed task stores
   - workflow engine
   - reusable execution context
   - shared `HarborApp` bootstrap entrypoint
@@ -76,6 +86,7 @@ harbor/
     harbor-core/
     harbor-ai/
     harbor-memory/
+    harbor-rag/
     harbor-runtime/
     harbor-mcp/
     harbor-http/
@@ -103,6 +114,12 @@ cargo run -p harbor-runtime --example hello_agent
 
 ```bash
 cargo run -p harbor-runtime --example streaming_agent
+```
+
+### Run the retrieval-aware agent example
+
+```bash
+cargo run -p harbor-runtime --example retrieval_agent
 ```
 
 ### Run the stdio MCP server example
@@ -166,7 +183,8 @@ GitHub Actions now runs:
 ## Near-term roadmap
 
 - typed tool schemas via derive macros
-- native provider-specific streaming adapters
 - richer observability hooks
-- vector memory backends
+- Anthropic native streaming adapter
+- Redis / Postgres state backends
+- vector retrieval backends
 - deployment templates for containerized AI services

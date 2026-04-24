@@ -114,6 +114,10 @@ impl CompletionEventStream {
         Self { receiver }
     }
 
+    fn from_receiver(receiver: UnboundedReceiver<FrameworkResult<CompletionEvent>>) -> Self {
+        Self { receiver }
+    }
+
     pub async fn recv(&mut self) -> Option<FrameworkResult<CompletionEvent>> {
         self.receiver.recv().await
     }
@@ -631,6 +635,7 @@ impl ModelProvider for OpenAICompatibleProvider {
             .json(&OpenAIChatRequest {
                 model: model.clone(),
                 messages: api_messages,
+                stream: false,
             })
             .send()
             .await
@@ -665,6 +670,63 @@ impl ModelProvider for OpenAICompatibleProvider {
             provider: self.name().into(),
             model: response.model.unwrap_or(model),
         })
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        let CompletionRequest {
+            model,
+            system_prompt,
+            messages,
+            ..
+        } = request;
+
+        let model = model_or_default(model, &self.config.default_model);
+        let mut api_messages = Vec::new();
+
+        if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
+            api_messages.push(OpenAIMessageRequest {
+                role: "system".into(),
+                content: system_prompt,
+            });
+        }
+
+        api_messages.extend(messages.into_iter().map(|message| OpenAIMessageRequest {
+            role: message.role.as_openai_role().into(),
+            content: message.content,
+        }));
+
+        let mut headers = HeaderMap::new();
+        inject_trace_context(&mut headers);
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/chat/completions",
+                self.config.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.config.api_key)
+            .headers(headers)
+            .json(&OpenAIChatRequest {
+                model: model.clone(),
+                messages: api_messages,
+                stream: true,
+            })
+            .send()
+            .await
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?;
+
+        let (sender, receiver) = unbounded_channel();
+        let provider = self.name().to_string();
+        tokio::spawn(async move {
+            stream_openai_response(response, sender, provider, model).await;
+        });
+
+        Ok(CompletionEventStream::from_receiver(receiver))
     }
 }
 
@@ -945,12 +1007,69 @@ impl ModelProvider for OllamaProvider {
             model: response.model.unwrap_or(model),
         })
     }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        let CompletionRequest {
+            model,
+            system_prompt,
+            messages,
+            ..
+        } = request;
+
+        let model = model_or_default(model, &self.config.default_model);
+        let mut api_messages = Vec::new();
+
+        if let Some(system_prompt) = system_prompt.filter(|value| !value.trim().is_empty()) {
+            api_messages.push(OllamaMessageRequest {
+                role: "system".into(),
+                content: system_prompt,
+            });
+        }
+
+        api_messages.extend(messages.into_iter().map(|message| OllamaMessageRequest {
+            role: message.role.as_ollama_role().into(),
+            content: message.content,
+        }));
+
+        let mut headers = HeaderMap::new();
+        inject_trace_context(&mut headers);
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/api/chat",
+                self.config.base_url.trim_end_matches('/')
+            ))
+            .headers(headers)
+            .json(&OllamaChatRequest {
+                model: model.clone(),
+                messages: api_messages,
+                stream: true,
+            })
+            .send()
+            .await
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| FrameworkError::Provider(error.to_string()))?;
+
+        let (sender, receiver) = unbounded_channel();
+        let provider = self.name().to_string();
+        tokio::spawn(async move {
+            stream_ollama_response(response, sender, provider, model).await;
+        });
+
+        Ok(CompletionEventStream::from_receiver(receiver))
+    }
 }
 
 #[derive(Debug, Serialize)]
 struct OpenAIChatRequest {
     model: String,
     messages: Vec<OpenAIMessageRequest>,
+    stream: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -974,6 +1093,25 @@ struct OpenAIChoice {
 
 #[derive(Debug, Deserialize)]
 struct OpenAIMessageResponse {
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIStreamResponse {
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<OpenAIStreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIStreamChoice {
+    delta: Option<OpenAIDeltaResponse>,
+    text: Option<String>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIDeltaResponse {
     content: Option<String>,
 }
 
@@ -1039,11 +1177,239 @@ struct OllamaMessageRequest {
 struct OllamaChatResponse {
     model: Option<String>,
     message: Option<OllamaMessageResponse>,
+    done: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OllamaMessageResponse {
     content: String,
+}
+
+async fn stream_openai_response(
+    mut response: reqwest::Response,
+    sender: tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
+    provider: String,
+    requested_model: String,
+) {
+    let _ = sender.send(Ok(CompletionEvent::Started {
+        provider: provider.clone(),
+        model: requested_model.clone(),
+    }));
+
+    let mut buffer = String::new();
+    let mut accumulated = String::new();
+    let mut response_model = requested_model;
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(frame) = take_sse_frame(&mut buffer) {
+                    for line in frame.lines() {
+                        let Some(data) = line.strip_prefix("data:") else {
+                            continue;
+                        };
+
+                        let data = data.trim();
+                        if data.is_empty() {
+                            continue;
+                        }
+
+                        if data == "[DONE]" {
+                            let _ = finish_stream(&sender, provider.clone(), response_model, accumulated);
+                            return;
+                        }
+
+                        match serde_json::from_str::<OpenAIStreamResponse>(data) {
+                            Ok(event) => {
+                                if let Some(model) = event.model {
+                                    response_model = model;
+                                }
+
+                                for choice in event.choices {
+                                    if let Some(text) = choice
+                                        .delta
+                                        .and_then(|delta| delta.content)
+                                        .or(choice.text)
+                                        .filter(|text| !text.is_empty())
+                                    {
+                                        accumulated.push_str(&text);
+                                        let _ = sender.send(Ok(CompletionEvent::Delta { text }));
+                                    }
+
+                                    if choice.finish_reason.is_some() {
+                                        let _ = finish_stream(
+                                            &sender,
+                                            provider.clone(),
+                                            response_model.clone(),
+                                            accumulated.clone(),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(FrameworkError::Provider(error.to_string())));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                let _ = finish_stream(&sender, provider.clone(), response_model, accumulated);
+                return;
+            }
+            Err(error) => {
+                let _ = sender.send(Err(FrameworkError::Provider(error.to_string())));
+                return;
+            }
+        }
+    }
+}
+
+async fn stream_ollama_response(
+    mut response: reqwest::Response,
+    sender: tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
+    provider: String,
+    requested_model: String,
+) {
+    let _ = sender.send(Ok(CompletionEvent::Started {
+        provider: provider.clone(),
+        model: requested_model.clone(),
+    }));
+
+    let mut buffer = String::new();
+    let mut accumulated = String::new();
+    let mut response_model = requested_model;
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(line) = take_line(&mut buffer) {
+                    if handle_ollama_stream_line(
+                        line,
+                        &sender,
+                        &provider,
+                        &mut response_model,
+                        &mut accumulated,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {
+                if !buffer.trim().is_empty()
+                    && handle_ollama_stream_line(
+                        std::mem::take(&mut buffer),
+                        &sender,
+                        &provider,
+                        &mut response_model,
+                        &mut accumulated,
+                    )
+                {
+                    return;
+                }
+
+                let _ = finish_stream(&sender, provider.clone(), response_model, accumulated);
+                return;
+            }
+            Err(error) => {
+                let _ = sender.send(Err(FrameworkError::Provider(error.to_string())));
+                return;
+            }
+        }
+    }
+}
+
+fn handle_ollama_stream_line(
+    line: String,
+    sender: &tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
+    provider: &str,
+    response_model: &mut String,
+    accumulated: &mut String,
+) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    match serde_json::from_str::<OllamaChatResponse>(line) {
+        Ok(event) => {
+            if let Some(model) = event.model {
+                *response_model = model;
+            }
+
+            if let Some(text) = event
+                .message
+                .and_then(|message| if message.content.is_empty() { None } else { Some(message.content) })
+            {
+                accumulated.push_str(&text);
+                let _ = sender.send(Ok(CompletionEvent::Delta { text }));
+            }
+
+            if event.done.unwrap_or(false) {
+                let _ = finish_stream(
+                    sender,
+                    provider.to_string(),
+                    response_model.clone(),
+                    accumulated.clone(),
+                );
+                return true;
+            }
+        }
+        Err(error) => {
+            let _ = sender.send(Err(FrameworkError::Provider(error.to_string())));
+            return true;
+        }
+    }
+
+    false
+}
+
+fn finish_stream(
+    sender: &tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
+    provider: String,
+    model: String,
+    accumulated: String,
+) -> Result<(), tokio::sync::mpsc::error::SendError<FrameworkResult<CompletionEvent>>> {
+    sender.send(Ok(CompletionEvent::Finished {
+        response: CompletionResponse {
+            text: accumulated,
+            structured: None,
+            provider,
+            model,
+        },
+    }))
+}
+
+fn take_sse_frame(buffer: &mut String) -> Option<String> {
+    if let Some(index) = buffer.find("\r\n\r\n") {
+        let frame = buffer[..index].to_string();
+        buffer.replace_range(..index + 4, "");
+        return Some(frame);
+    }
+
+    if let Some(index) = buffer.find("\n\n") {
+        let frame = buffer[..index].to_string();
+        buffer.replace_range(..index + 2, "");
+        return Some(frame);
+    }
+
+    None
+}
+
+fn take_line(buffer: &mut String) -> Option<String> {
+    if let Some(index) = buffer.find('\n') {
+        let line = buffer[..index].trim_end_matches('\r').to_string();
+        buffer.replace_range(..index + 1, "");
+        Some(line)
+    } else {
+        None
+    }
 }
 
 fn model_or_default(model: String, default_model: &str) -> String {
@@ -1090,7 +1456,11 @@ impl Injector for HeaderInjector<'_> {
 mod tests {
     use super::*;
     use axum::{
-        extract::State, http::HeaderMap, response::IntoResponse, routing::post, Json, Router,
+        extract::State,
+        http::{header::CONTENT_TYPE, HeaderMap},
+        response::IntoResponse,
+        routing::post,
+        Json, Router,
     };
     use opentelemetry::{
         global,
@@ -1447,6 +1817,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_provider_maps_request_and_response() {
+        global::set_text_map_propagator(TraceContextPropagator::new());
+
+        let state = CaptureState::default();
+        let app = Router::new()
+            .route("/chat/completions", post(openai_handler))
+            .with_state(state.clone());
+        let base_url = spawn_router(app).await;
+
+        let provider = OpenAICompatibleProvider::new(OpenAICompatibleConfig {
+            api_key: "openai-test-key".into(),
+            base_url,
+            default_model: "gpt-test-model".into(),
+        });
+
+        let response = provider
+            .complete(CompletionRequest {
+                model: String::new(),
+                system_prompt: Some("Be direct".into()),
+                messages: vec![Message {
+                    role: MessageRole::User,
+                    content: "Hello from OpenAI".into(),
+                }],
+                tools: vec![],
+                response_schema: None,
+                session_id: Some("session-openai".into()),
+                tool_choice: ToolChoice::Auto,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.provider, "openai-compatible");
+        assert_eq!(response.model, "gpt-test-model");
+        assert_eq!(response.text, "Hi from OpenAI");
+
+        let captured = state.take_one();
+        let headers = captured
+            .headers
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        if let Some(traceparent) = headers.get("traceparent") {
+            assert!(traceparent.starts_with("00-"));
+            assert!(!traceparent.trim().is_empty());
+        }
+
+        assert_eq!(captured.body["model"], "gpt-test-model");
+        assert_eq!(captured.body["stream"], false);
+        assert_eq!(captured.body["messages"][0]["role"], "system");
+        assert_eq!(captured.body["messages"][0]["content"], "Be direct");
+        assert_eq!(captured.body["messages"][1]["role"], "user");
+        assert_eq!(captured.body["messages"][1]["content"], "Hello from OpenAI");
+    }
+
+    #[tokio::test]
+    async fn openai_provider_streams_native_events() {
+        let state = CaptureState::default();
+        let app = Router::new()
+            .route("/chat/completions", post(openai_handler))
+            .with_state(state.clone());
+        let base_url = spawn_router(app).await;
+
+        let provider = OpenAICompatibleProvider::new(OpenAICompatibleConfig {
+            api_key: "openai-test-key".into(),
+            base_url,
+            default_model: "gpt-test-model".into(),
+        });
+
+        let mut stream = provider
+            .complete_stream(CompletionRequest {
+                model: String::new(),
+                system_prompt: None,
+                messages: vec![Message {
+                    role: MessageRole::User,
+                    content: "Stream it".into(),
+                }],
+                tools: vec![],
+                response_schema: None,
+                session_id: Some("session-openai-stream".into()),
+                tool_choice: ToolChoice::Auto,
+            })
+            .await
+            .unwrap();
+
+        let mut saw_started = false;
+        let mut deltas = String::new();
+        let mut finished = None;
+
+        while let Some(event) = stream.recv().await {
+            match event.unwrap() {
+                CompletionEvent::Started { provider, model } => {
+                    saw_started = true;
+                    assert_eq!(provider, "openai-compatible");
+                    assert_eq!(model, "gpt-test-model");
+                }
+                CompletionEvent::Delta { text } => deltas.push_str(&text),
+                CompletionEvent::Finished { response } => finished = Some(response),
+            }
+        }
+
+        assert!(saw_started);
+        assert_eq!(deltas, "Hi from OpenAI stream");
+        assert_eq!(finished.unwrap().text, "Hi from OpenAI stream");
+
+        let captured = state.take_one();
+        assert_eq!(captured.body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn openai_config_reads_env() {
+        unsafe {
+            env::set_var("HARBOR_OPENAI_API_KEY", "secret");
+            env::set_var("HARBOR_OPENAI_BASE_URL", "https://openai.example/v1");
+            env::set_var("HARBOR_OPENAI_MODEL", "gpt-env");
+        }
+
+        let config = OpenAICompatibleConfig::from_env().unwrap();
+        assert_eq!(config.api_key, "secret");
+        assert_eq!(config.base_url, "https://openai.example/v1");
+        assert_eq!(config.default_model, "gpt-env");
+
+        unsafe {
+            env::remove_var("HARBOR_OPENAI_API_KEY");
+            env::remove_var("HARBOR_OPENAI_BASE_URL");
+            env::remove_var("HARBOR_OPENAI_MODEL");
+        }
+    }
+
+    async fn openai_handler(
+        State(state): State<CaptureState>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> impl IntoResponse {
+        state.push(CapturedRequest {
+            headers: headers_to_vec(&headers),
+            body: body.clone(),
+        });
+
+        if body.get("stream").and_then(|value| value.as_bool()) == Some(true) {
+            return (
+                [(CONTENT_TYPE, "text/event-stream")],
+                concat!(
+                    "data: {\"model\":\"gpt-test-model\",\"choices\":[{\"delta\":{\"content\":\"Hi from \"}}]}\n\n",
+                    "data: {\"model\":\"gpt-test-model\",\"choices\":[{\"delta\":{\"content\":\"OpenAI stream\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+                .into_response();
+        }
+
+        Json(json!({
+            "model": "gpt-test-model",
+            "choices": [
+                {
+                    "message": { "content": "Hi from OpenAI" }
+                }
+            ]
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
     async fn anthropic_provider_maps_request_and_response() {
         global::set_text_map_propagator(TraceContextPropagator::new());
 
@@ -1646,8 +2177,20 @@ mod tests {
     ) -> impl IntoResponse {
         state.push(CapturedRequest {
             headers: headers_to_vec(&headers),
-            body,
+            body: body.clone(),
         });
+
+        if body.get("stream").and_then(|value| value.as_bool()) == Some(true) {
+            return (
+                [(CONTENT_TYPE, "application/x-ndjson")],
+                concat!(
+                    "{\"model\":\"llama-test-model\",\"message\":{\"role\":\"assistant\",\"content\":\"Hi from \"},\"done\":false}\n",
+                    "{\"model\":\"llama-test-model\",\"message\":{\"role\":\"assistant\",\"content\":\"Ollama stream\"},\"done\":false}\n",
+                    "{\"model\":\"llama-test-model\",\"done\":true}\n"
+                ),
+            )
+                .into_response();
+        }
 
         Json(json!({
             "model": "llama-test-model",
@@ -1657,6 +2200,59 @@ mod tests {
             },
             "done": true
         }))
+    }
+
+    #[tokio::test]
+    async fn ollama_provider_streams_native_events() {
+        let state = CaptureState::default();
+        let app = Router::new()
+            .route("/api/chat", post(ollama_handler))
+            .with_state(state.clone());
+        let base_url = spawn_router(app).await;
+
+        let provider = OllamaProvider::new(OllamaConfig {
+            base_url,
+            default_model: "llama-test-model".into(),
+        });
+
+        let mut stream = provider
+            .complete_stream(CompletionRequest {
+                model: String::new(),
+                system_prompt: None,
+                messages: vec![Message {
+                    role: MessageRole::User,
+                    content: "Stream from Ollama".into(),
+                }],
+                tools: vec![],
+                response_schema: None,
+                session_id: Some("session-ollama-stream".into()),
+                tool_choice: ToolChoice::Auto,
+            })
+            .await
+            .unwrap();
+
+        let mut saw_started = false;
+        let mut deltas = String::new();
+        let mut finished = None;
+
+        while let Some(event) = stream.recv().await {
+            match event.unwrap() {
+                CompletionEvent::Started { provider, model } => {
+                    saw_started = true;
+                    assert_eq!(provider, "ollama");
+                    assert_eq!(model, "llama-test-model");
+                }
+                CompletionEvent::Delta { text } => deltas.push_str(&text),
+                CompletionEvent::Finished { response } => finished = Some(response),
+            }
+        }
+
+        assert!(saw_started);
+        assert_eq!(deltas, "Hi from Ollama stream");
+        assert_eq!(finished.unwrap().text, "Hi from Ollama stream");
+
+        let captured = state.take_one();
+        assert_eq!(captured.body["stream"], true);
     }
 
     async fn spawn_router(router: Router) -> String {

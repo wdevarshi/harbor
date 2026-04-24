@@ -9,11 +9,15 @@
 - Ollama provider client
 - provider retry / timeout / fallback helpers
 - provider/runtime event streaming hooks
+- native OpenAI-compatible and Ollama streaming adapters
 - typed schema helpers for tool definitions
 - structured output helpers
 - tool registry
 - session memory abstraction
+- file-backed session memory persistence
+- document store + lexical retrieval + prompt injection helpers
 - agent runtime
+- lifecycle task primitives with checkpoints
 - workflow engine
 - shared `HarborApp` runtime/bootstrap entrypoint
 - signal-driven graceful shutdown wiring for the shared app runtime
@@ -41,6 +45,7 @@
 - broader behavioral test coverage across crates
 
 ## Phase 3 - Richer AI integrations
+- native Anthropic streaming adapter
 
 ## Phase 4 - Richer MCP support
 - richer auth/retry configuration for HTTP transport
@@ -54,5 +59,5 @@
 ## Phase 6 - Data + memory
 - vector store integrations
 - Redis / Postgres memory backends
-- RAG pipeline helpers
-- document ingestion adapters
+- vector retrieval backends
+- richer document ingestion adapters

@@ -7,8 +7,9 @@ Harbor is a workspace of focused crates that compose into an AI application plat
 - **core**: shared primitives and tool contracts
   - typed schema helpers for tool contracts
 - **ai**: provider abstractions, model-facing types, and event streaming hooks
-- **memory**: session and state retention
-- **runtime**: agents, workflows, and streaming turn orchestration
+- **memory**: session and state retention, including file-backed persistence
+- **rag**: document ingestion, chunking, retrieval, and prompt injection helpers
+- **runtime**: agents, workflows, streaming turn orchestration, and task lifecycles
 - **mcp**: MCP server/client protocol and transports
 - **http**: health/readiness/metrics and ops-facing HTTP surface
 - **observability**: tracing/log bootstrap and Prometheus setup
@@ -40,24 +41,35 @@ Tools are defined once and reused in:
 
 ### 3. Memory
 Memory is session-scoped and provider-agnostic.
-The first implementation is in-memory, but the interface allows:
+The baseline now includes both in-memory and file-backed session memory, while the interface still leaves room for:
 - Redis
 - Postgres
 - vector stores
 - hybrid memory
 
-### 4. Runtime
+### 4. Retrieval / documents
+The retrieval layer keeps document-oriented augmentation separate from conversational memory.
+It currently provides:
+- document store abstractions
+- in-memory and file-backed document stores
+- deterministic document chunking
+- lexical retrieval for zero-dependency local RAG
+- prompt injection helpers that runtime surfaces can compose into turns
+
+### 5. Runtime
 Runtime orchestrates:
 - prompt/system state
 - memory loading
 - provider invocation
 - streaming turn execution
+- retrieval-aware turn execution
+- lifecycle task state transitions and checkpoints
 - tool registry access
 - workflow state transitions
 - shared application bootstrap (`HarborApp`)
 - signal-driven shutdown and readiness wiring
 
-### 5. MCP
+### 6. MCP
 The MCP layer turns the same tool registry into an MCP server.
 This keeps the framework from duplicating tool definitions between:
 - internal runtime use
@@ -72,7 +84,7 @@ The current MCP baseline includes:
 - capability reporting via `initialize`
 - outbound trace-context injection for MCP HTTP client calls
 
-### 6. HTTP / ops
+### 7. HTTP / ops
 The HTTP layer provides the operational surface around Harbor runtimes:
 - `/healthcheck`
 - `/readycheck`
@@ -86,7 +98,7 @@ The HTTP layer provides the operational surface around Harbor runtimes:
 
 This is Harbor's equivalent of the production defaults that frameworks like ColdBrew expose for service operations.
 
-### 7. Observability
+### 8. Observability
 The observability layer bootstraps the global cross-cutting runtime concerns:
 - tracing/log subscriber setup
 - log level + JSON log configuration

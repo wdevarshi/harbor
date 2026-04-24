@@ -1,14 +1,27 @@
+use async_trait::async_trait;
 use harbor_ai::{
     CompletionEvent, CompletionEventStream, CompletionRequest, CompletionResponse, Message,
     MessageRole, ModelProvider, ToolChoice,
 };
-use harbor_core::{FrameworkError, FrameworkResult, ToolRegistry};
+use harbor_core::{FrameworkError, FrameworkResult, JsonValue, ToolRegistry};
 use harbor_http::{HarborHttpConfig, HarborHttpMiddlewareConfig, HarborHttpServer, ReadinessGate};
 use harbor_memory::{MemoryMessage, SessionMemory};
 use harbor_observability::{HarborObservability, HarborObservabilityConfig};
+use harbor_rag::{render_retrieved_context, RetrievedChunk, RetrievalQuery, Retriever};
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    fs,
+    sync::{Mutex, RwLock},
+};
 use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AgentRuntime<P, M> {
@@ -16,6 +29,44 @@ pub struct AgentRuntime<P, M> {
     memory: M,
     tools: ToolRegistry,
     default_model: String,
+    base_system_prompt: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunContext {
+    pub extra_system_prompt: Option<String>,
+    pub retrieved_chunks: Vec<RetrievedChunk>,
+}
+
+impl RunContext {
+    pub fn with_retrieved_chunks(mut self, retrieved_chunks: Vec<RetrievedChunk>) -> Self {
+        self.retrieved_chunks = retrieved_chunks;
+        self
+    }
+
+    pub fn with_extra_system_prompt(mut self, extra_system_prompt: impl Into<String>) -> Self {
+        self.extra_system_prompt = Some(extra_system_prompt.into());
+        self
+    }
+
+    fn merge_system_prompt(&self, base_system_prompt: &str) -> Option<String> {
+        let mut sections = Vec::new();
+        if !base_system_prompt.trim().is_empty() {
+            sections.push(base_system_prompt.trim().to_string());
+        }
+        if let Some(extra) = self.extra_system_prompt.as_ref().filter(|value| !value.trim().is_empty()) {
+            sections.push(extra.trim().to_string());
+        }
+        if let Some(context) = render_retrieved_context(&self.retrieved_chunks) {
+            sections.push(context);
+        }
+
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
+    }
 }
 
 pub struct RuntimeEventStream<M> {
@@ -106,6 +157,7 @@ where
             memory,
             tools: ToolRegistry::new(),
             default_model: "mock-model".into(),
+            base_system_prompt: "You are Harbor runtime".into(),
         }
     }
 
@@ -119,7 +171,17 @@ where
         self
     }
 
-    async fn build_request(&self, session_id: &str, user_input: String) -> CompletionRequest {
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.base_system_prompt = system_prompt.into();
+        self
+    }
+
+    async fn build_request(
+        &self,
+        session_id: &str,
+        user_input: String,
+        context: &RunContext,
+    ) -> CompletionRequest {
         let history = self.memory.messages(session_id).await;
 
         let mut messages: Vec<Message> = history
@@ -142,7 +204,7 @@ where
 
         CompletionRequest {
             model: self.default_model.clone(),
-            system_prompt: Some("You are Harbor runtime".into()),
+            system_prompt: context.merge_system_prompt(&self.base_system_prompt),
             messages,
             tools: self.tools.list(),
             response_schema: None,
@@ -156,8 +218,18 @@ where
         session_id: &str,
         user_input: impl Into<String>,
     ) -> FrameworkResult<CompletionResponse> {
+        self.run_turn_with_context(session_id, user_input, RunContext::default())
+            .await
+    }
+
+    pub async fn run_turn_with_context(
+        &self,
+        session_id: &str,
+        user_input: impl Into<String>,
+        context: RunContext,
+    ) -> FrameworkResult<CompletionResponse> {
         let user_input = user_input.into();
-        let request = self.build_request(session_id, user_input.clone()).await;
+        let request = self.build_request(session_id, user_input.clone(), &context).await;
         let response = self.provider.complete(request).await?;
 
         self.memory
@@ -173,13 +245,43 @@ where
         Ok(response)
     }
 
+    pub async fn run_turn_with_retrieval<R>(
+        &self,
+        session_id: &str,
+        user_input: impl Into<String>,
+        retriever: &R,
+        query: RetrievalQuery,
+    ) -> FrameworkResult<CompletionResponse>
+    where
+        R: Retriever,
+    {
+        let user_input = user_input.into();
+        let retrieved_chunks = retriever.retrieve(&user_input, query).await?;
+        self.run_turn_with_context(
+            session_id,
+            user_input,
+            RunContext::default().with_retrieved_chunks(retrieved_chunks),
+        )
+        .await
+    }
+
     pub async fn run_turn_stream(
         &self,
         session_id: &str,
         user_input: impl Into<String>,
     ) -> FrameworkResult<RuntimeEventStream<M>> {
+        self.run_turn_stream_with_context(session_id, user_input, RunContext::default())
+            .await
+    }
+
+    pub async fn run_turn_stream_with_context(
+        &self,
+        session_id: &str,
+        user_input: impl Into<String>,
+        context: RunContext,
+    ) -> FrameworkResult<RuntimeEventStream<M>> {
         let user_input = user_input.into();
-        let request = self.build_request(session_id, user_input.clone()).await;
+        let request = self.build_request(session_id, user_input.clone(), &context).await;
         let stream = self.provider.complete_stream(request).await?;
 
         Ok(RuntimeEventStream::new(
@@ -189,6 +291,283 @@ where
             user_input,
         ))
     }
+
+    pub async fn run_turn_stream_with_retrieval<R>(
+        &self,
+        session_id: &str,
+        user_input: impl Into<String>,
+        retriever: &R,
+        query: RetrievalQuery,
+    ) -> FrameworkResult<RuntimeEventStream<M>>
+    where
+        R: Retriever,
+    {
+        let user_input = user_input.into();
+        let retrieved_chunks = retriever.retrieve(&user_input, query).await?;
+        self.run_turn_stream_with_context(
+            session_id,
+            user_input,
+            RunContext::default().with_retrieved_chunks(retrieved_chunks),
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskCheckpoint {
+    pub label: String,
+    pub data: JsonValue,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskRecord {
+    pub id: String,
+    pub name: String,
+    pub input: JsonValue,
+    pub state: TaskState,
+    pub output: Option<JsonValue>,
+    pub error: Option<String>,
+    pub attempts: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub checkpoints: Vec<TaskCheckpoint>,
+}
+
+impl TaskRecord {
+    pub fn queued(name: impl Into<String>, input: JsonValue) -> Self {
+        let now = now_millis();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            input,
+            state: TaskState::Queued,
+            output: None,
+            error: None,
+            attempts: 0,
+            created_at_ms: now,
+            updated_at_ms: now,
+            checkpoints: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait TaskStore: Send + Sync + Clone + 'static {
+    async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord>;
+    async fn get(&self, id: &str) -> FrameworkResult<Option<TaskRecord>>;
+    async fn list(&self) -> FrameworkResult<Vec<TaskRecord>>;
+    async fn delete(&self, id: &str) -> FrameworkResult<()>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryTaskStore {
+    inner: Arc<RwLock<HashMap<String, TaskRecord>>>,
+}
+
+#[async_trait]
+impl TaskStore for InMemoryTaskStore {
+    async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord> {
+        self.inner
+            .write()
+            .await
+            .insert(task.id.clone(), task.clone());
+        Ok(task)
+    }
+
+    async fn get(&self, id: &str) -> FrameworkResult<Option<TaskRecord>> {
+        Ok(self.inner.read().await.get(id).cloned())
+    }
+
+    async fn list(&self) -> FrameworkResult<Vec<TaskRecord>> {
+        let mut tasks = self.inner.read().await.values().cloned().collect::<Vec<_>>();
+        tasks.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        Ok(tasks)
+    }
+
+    async fn delete(&self, id: &str) -> FrameworkResult<()> {
+        self.inner.write().await.remove(id);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileTaskStore {
+    root: Arc<PathBuf>,
+    write_lock: Arc<Mutex<()>>,
+}
+
+impl FileTaskStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: Arc::new(root.into()),
+            write_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.as_ref().as_path()
+    }
+
+    fn task_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.json"))
+    }
+}
+
+#[async_trait]
+impl TaskStore for FileTaskStore {
+    async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord> {
+        let _guard = self.write_lock.lock().await;
+        fs::create_dir_all(self.root()).await?;
+        let path = self.task_path(&task.id);
+        fs::write(path, serde_json::to_string_pretty(&task)?).await?;
+        Ok(task)
+    }
+
+    async fn get(&self, id: &str) -> FrameworkResult<Option<TaskRecord>> {
+        let path = self.task_path(id);
+        match fs::read_to_string(path).await {
+            Ok(content) => Ok(Some(serde_json::from_str(&content)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn list(&self) -> FrameworkResult<Vec<TaskRecord>> {
+        fs::create_dir_all(self.root()).await?;
+        let mut entries = fs::read_dir(self.root()).await?;
+        let mut tasks = Vec::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_file() {
+                let content = fs::read_to_string(entry.path()).await?;
+                tasks.push(serde_json::from_str(&content)?);
+            }
+        }
+
+        tasks.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        Ok(tasks)
+    }
+
+    async fn delete(&self, id: &str) -> FrameworkResult<()> {
+        let _guard = self.write_lock.lock().await;
+        let path = self.task_path(id);
+        match fs::remove_file(path).await {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskLifecycle<S> {
+    store: S,
+}
+
+impl<S> TaskLifecycle<S>
+where
+    S: TaskStore,
+{
+    pub fn new(store: S) -> Self {
+        Self { store }
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    pub async fn enqueue(&self, name: impl Into<String>, input: JsonValue) -> FrameworkResult<TaskRecord> {
+        self.store.put(TaskRecord::queued(name, input)).await
+    }
+
+    pub async fn start(&self, id: &str) -> FrameworkResult<TaskRecord> {
+        self.update(id, |task| {
+            task.state = TaskState::Running;
+            task.attempts += 1;
+            task.error = None;
+            task.updated_at_ms = now_millis();
+        })
+        .await
+    }
+
+    pub async fn checkpoint(
+        &self,
+        id: &str,
+        label: impl Into<String>,
+        data: JsonValue,
+    ) -> FrameworkResult<TaskRecord> {
+        let label = label.into();
+        self.update(id, move |task| {
+            task.checkpoints.push(TaskCheckpoint {
+                label: label.clone(),
+                data: data.clone(),
+                created_at_ms: now_millis(),
+            });
+            task.updated_at_ms = now_millis();
+        })
+        .await
+    }
+
+    pub async fn complete(&self, id: &str, output: JsonValue) -> FrameworkResult<TaskRecord> {
+        self.update(id, move |task| {
+            task.state = TaskState::Completed;
+            task.output = Some(output.clone());
+            task.error = None;
+            task.updated_at_ms = now_millis();
+        })
+        .await
+    }
+
+    pub async fn fail(&self, id: &str, error: impl Into<String>) -> FrameworkResult<TaskRecord> {
+        let error = error.into();
+        self.update(id, move |task| {
+            task.state = TaskState::Failed;
+            task.error = Some(error.clone());
+            task.updated_at_ms = now_millis();
+        })
+        .await
+    }
+
+    pub async fn cancel(&self, id: &str, reason: impl Into<String>) -> FrameworkResult<TaskRecord> {
+        let reason = reason.into();
+        self.update(id, move |task| {
+            task.state = TaskState::Cancelled;
+            task.error = Some(reason.clone());
+            task.updated_at_ms = now_millis();
+        })
+        .await
+    }
+
+    async fn update<F>(&self, id: &str, mut mutator: F) -> FrameworkResult<TaskRecord>
+    where
+        F: FnMut(&mut TaskRecord) + Send,
+    {
+        let mut task = self
+            .store
+            .get(id)
+            .await?
+            .ok_or_else(|| FrameworkError::Memory(format!("task '{id}' not found")))?;
+        mutator(&mut task);
+        self.store.put(task).await
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,8 +826,42 @@ pub async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harbor_ai::{CompletionEvent, MockProvider};
+    use harbor_ai::{CompletionEvent, CompletionRequest, MockProvider};
     use harbor_memory::{InMemorySessionMemory, SessionMemory};
+    use harbor_rag::{Document, DocumentStore, InMemoryDocumentStore, LexicalRetriever};
+    use std::{sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{suffix}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[derive(Clone)]
+    struct CapturingProvider {
+        prompts: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for CapturingProvider {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+            self.prompts.lock().unwrap().push(request.system_prompt.clone());
+            Ok(CompletionResponse {
+                text: "captured".into(),
+                structured: None,
+                provider: self.name().into(),
+                model: request.model,
+            })
+        }
+    }
 
     #[tokio::test]
     async fn run_turn_stream_emits_events_and_persists_memory() {
@@ -488,5 +901,83 @@ mod tests {
         assert_eq!(history[0].content, "Hello from streaming Harbor");
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[1].content, expected);
+    }
+
+    #[tokio::test]
+    async fn run_turn_with_retrieval_injects_rendered_document_context() {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingProvider {
+            prompts: prompts.clone(),
+        };
+        let runtime = AgentRuntime::new(provider, InMemorySessionMemory::default())
+            .with_default_model("capture-model");
+
+        let store = InMemoryDocumentStore::default();
+        store
+            .put(Document::new(
+                "Runbook",
+                "Restart the worker and inspect the queue logs before scaling.",
+            ))
+            .await
+            .unwrap();
+
+        let retriever = LexicalRetriever::new(store);
+        runtime
+            .run_turn_with_retrieval(
+                "retrieval-session",
+                "How do I inspect the queue logs?",
+                &retriever,
+                RetrievalQuery::default(),
+            )
+            .await
+            .unwrap();
+
+        let prompt = prompts.lock().unwrap().pop().unwrap().unwrap();
+        assert!(prompt.contains("You are Harbor runtime"));
+        assert!(prompt.contains("Runbook"));
+        assert!(prompt.contains("queue logs"));
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle_tracks_state_checkpoints_and_output() {
+        let lifecycle = TaskLifecycle::new(InMemoryTaskStore::default());
+        let task = lifecycle
+            .enqueue("summarize-docs", serde_json::json!({"doc": "abc"}))
+            .await
+            .unwrap();
+        assert_eq!(task.state, TaskState::Queued);
+
+        let task = lifecycle.start(&task.id).await.unwrap();
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.attempts, 1);
+
+        let task = lifecycle
+            .checkpoint(&task.id, "retrieved", serde_json::json!({"chunks": 2}))
+            .await
+            .unwrap();
+        assert_eq!(task.checkpoints.len(), 1);
+        assert_eq!(task.checkpoints[0].label, "retrieved");
+
+        let task = lifecycle
+            .complete(&task.id, serde_json::json!({"status": "ok"}))
+            .await
+            .unwrap();
+        assert_eq!(task.state, TaskState::Completed);
+        assert_eq!(task.output.unwrap()["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn file_task_store_persists_tasks_between_instances() {
+        let root = temp_dir("harbor-task-store-test");
+        let store = FileTaskStore::new(&root);
+        let task = TaskRecord::queued("sync", serde_json::json!({"kind": "delta"}));
+        let id = task.id.clone();
+        store.put(task.clone()).await.unwrap();
+
+        let restored = FileTaskStore::new(&root);
+        let fetched = restored.get(&id).await.unwrap().unwrap();
+        assert_eq!(fetched, task);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
