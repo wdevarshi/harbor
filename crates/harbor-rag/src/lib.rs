@@ -232,7 +232,7 @@ impl DocumentStore for FileDocumentStore {
     async fn list(&self) -> FrameworkResult<Vec<Document>> {
         fs::create_dir_all(self.root()).await?;
         let mut entries = fs::read_dir(self.root()).await?;
-        let mut documents = Vec::new();
+        let mut documents: Vec<Document> = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_file() {
