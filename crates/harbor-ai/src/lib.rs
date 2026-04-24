@@ -2200,6 +2200,7 @@ mod tests {
             },
             "done": true
         }))
+        .into_response()
     }
 
     #[tokio::test]

@@ -446,7 +446,7 @@ impl TaskStore for FileTaskStore {
     async fn list(&self) -> FrameworkResult<Vec<TaskRecord>> {
         fs::create_dir_all(self.root()).await?;
         let mut entries = fs::read_dir(self.root()).await?;
-        let mut tasks = Vec::new();
+        let mut tasks: Vec<TaskRecord> = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_file() {
