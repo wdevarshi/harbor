@@ -12,17 +12,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run_turn_stream("demo-session", "Hello from the Harbor streaming example")
         .await?;
 
+    println!(
+        "runtime stream ready run_id={} stream_id={}",
+        stream.run_id(),
+        stream.stream_id()
+    );
+
     while let Some(event) = stream.recv().await {
         match event? {
-            CompletionEvent::Started { provider, model } => {
-                println!("stream started via {provider}:{model}");
+            CompletionEvent::Started {
+                run_id,
+                stream_id,
+                sequence,
+                provider,
+                model,
+            } => {
+                println!(
+                    "stream started run_id={run_id} stream_id={stream_id} seq={sequence} via {provider}:{model}"
+                );
             }
-            CompletionEvent::Delta { text } => {
-                print!("{text}");
+            CompletionEvent::Delta {
+                sequence,
+                offset,
+                text,
+                ..
+            } => {
+                print!("[seq={sequence} offset={offset}] {text}");
                 io::stdout().flush()?;
             }
-            CompletionEvent::Finished { .. } => {
-                println!();
+            CompletionEvent::Finished {
+                run_id,
+                stream_id,
+                sequence,
+                response,
+            } => {
+                println!(
+                    "\nstream finished run_id={run_id} stream_id={stream_id} seq={sequence} text_len={}",
+                    response.text.len()
+                );
             }
         }
     }

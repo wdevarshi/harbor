@@ -7,8 +7,10 @@
 - OpenAI-compatible provider client
 - Anthropic provider client
 - Ollama provider client
-- provider retry / timeout / fallback helpers
-- provider/runtime event streaming hooks
+- provider retry / backoff / timeout / fallback helpers
+- provider circuit-breaker suppression helper
+- structured provider/runtime event streaming envelopes
+- deterministic final stream reconstruction guarantees
 - native OpenAI-compatible and Ollama streaming adapters
 - typed schema helpers for tool definitions
 - structured output helpers
@@ -44,7 +46,7 @@
 
 ## Phase 2 - Runtime and ops
 - richer lifecycle hooks for background workers and subsystems
-- reconnect/resume-friendly structured streaming surfaces
+- persisted stream replay / resume APIs on top of the structured event model
 - OTEL log/metric exporter options
 - broader behavioral test coverage across crates
 

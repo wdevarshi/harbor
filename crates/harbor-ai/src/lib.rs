@@ -6,11 +6,16 @@ use reqwest::{
     Client,
 };
 use serde::{Deserialize, Serialize};
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::time::{sleep, timeout};
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use uuid::Uuid;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 1024;
@@ -74,6 +79,22 @@ pub struct CompletionRequest {
     pub response_schema: Option<JsonValue>,
     pub session_id: Option<String>,
     pub tool_choice: ToolChoice,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_id: Option<String>,
+}
+
+impl CompletionRequest {
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
+    pub fn with_stream_id(mut self, stream_id: impl Into<String>) -> Self {
+        self.stream_id = Some(stream_id.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,14 +103,137 @@ pub struct CompletionResponse {
     pub structured: Option<JsonValue>,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CompletionEvent {
-    Started { provider: String, model: String },
-    Delta { text: String },
-    Finished { response: CompletionResponse },
+    Started {
+        run_id: String,
+        stream_id: String,
+        sequence: u64,
+        provider: String,
+        model: String,
+    },
+    Delta {
+        run_id: String,
+        stream_id: String,
+        sequence: u64,
+        offset: usize,
+        text: String,
+    },
+    Finished {
+        run_id: String,
+        stream_id: String,
+        sequence: u64,
+        response: CompletionResponse,
+    },
+}
+
+impl CompletionEvent {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Started { run_id, .. }
+            | Self::Delta { run_id, .. }
+            | Self::Finished { run_id, .. } => run_id,
+        }
+    }
+
+    pub fn stream_id(&self) -> &str {
+        match self {
+            Self::Started { stream_id, .. }
+            | Self::Delta { stream_id, .. }
+            | Self::Finished { stream_id, .. } => stream_id,
+        }
+    }
+
+    pub fn sequence(&self) -> u64 {
+        match self {
+            Self::Started { sequence, .. }
+            | Self::Delta { sequence, .. }
+            | Self::Finished { sequence, .. } => *sequence,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StreamEnvelopeState {
+    run_id: String,
+    stream_id: String,
+    next_sequence: u64,
+    accumulated_text: String,
+}
+
+impl StreamEnvelopeState {
+    fn from_request(request: &CompletionRequest) -> Self {
+        Self::from_ids(request.run_id.clone(), request.stream_id.clone())
+    }
+
+    fn from_ids(run_id: Option<String>, stream_id: Option<String>) -> Self {
+        Self {
+            run_id: run_id.unwrap_or_else(new_run_id),
+            stream_id: stream_id.unwrap_or_else(new_stream_id),
+            next_sequence: 0,
+            accumulated_text: String::new(),
+        }
+    }
+
+    fn from_response(response: &CompletionResponse, stream_id: Option<String>) -> Self {
+        Self {
+            run_id: response.run_id.clone().unwrap_or_else(new_run_id),
+            stream_id: stream_id.unwrap_or_else(new_stream_id),
+            next_sequence: 0,
+            accumulated_text: String::new(),
+        }
+    }
+
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        sequence
+    }
+
+    fn started_event(&mut self, provider: String, model: String) -> CompletionEvent {
+        CompletionEvent::Started {
+            run_id: self.run_id.clone(),
+            stream_id: self.stream_id.clone(),
+            sequence: self.next_sequence(),
+            provider,
+            model,
+        }
+    }
+
+    fn delta_event(&mut self, text: String) -> CompletionEvent {
+        let offset = self.accumulated_text.len();
+        self.accumulated_text.push_str(&text);
+
+        CompletionEvent::Delta {
+            run_id: self.run_id.clone(),
+            stream_id: self.stream_id.clone(),
+            sequence: self.next_sequence(),
+            offset,
+            text,
+        }
+    }
+
+    fn finished_event(&mut self, mut response: CompletionResponse) -> CompletionEvent {
+        if response.run_id.is_none() {
+            response.run_id = Some(self.run_id.clone());
+        }
+
+        if !self.accumulated_text.is_empty() {
+            response.text = self.accumulated_text.clone();
+        }
+
+        CompletionEvent::Finished {
+            run_id: self.run_id.clone(),
+            stream_id: self.stream_id.clone(),
+            sequence: self.next_sequence(),
+            response,
+        }
+    }
 }
 
 pub struct CompletionEventStream {
@@ -98,17 +242,25 @@ pub struct CompletionEventStream {
 
 impl CompletionEventStream {
     pub fn from_response(response: CompletionResponse) -> Self {
+        Self::from_response_with_stream_id(response, None)
+    }
+
+    pub fn from_response_with_stream_id(
+        response: CompletionResponse,
+        stream_id: Option<String>,
+    ) -> Self {
         let (sender, receiver) = unbounded_channel();
-        let _ = sender.send(Ok(CompletionEvent::Started {
-            provider: response.provider.clone(),
-            model: response.model.clone(),
-        }));
+        let mut envelope = StreamEnvelopeState::from_response(&response, stream_id);
+        let _ = sender.send(Ok(envelope.started_event(
+            response.provider.clone(),
+            response.model.clone(),
+        )));
 
         for chunk in split_stream_chunks(&response.text) {
-            let _ = sender.send(Ok(CompletionEvent::Delta { text: chunk }));
+            let _ = sender.send(Ok(envelope.delta_event(chunk)));
         }
 
-        let _ = sender.send(Ok(CompletionEvent::Finished { response }));
+        let _ = sender.send(Ok(envelope.finished_event(response)));
         drop(sender);
 
         Self { receiver }
@@ -132,8 +284,21 @@ pub trait ModelProvider: Send + Sync {
         &self,
         request: CompletionRequest,
     ) -> FrameworkResult<CompletionEventStream> {
+        let stream_id = request.stream_id.clone();
+        let run_id = request.run_id.clone();
         let response = self.complete(request).await?;
-        Ok(CompletionEventStream::from_response(response))
+        let response = if response.run_id.is_some() {
+            response
+        } else {
+            CompletionResponse {
+                run_id,
+                ..response
+            }
+        };
+        Ok(CompletionEventStream::from_response_with_stream_id(
+            response,
+            stream_id,
+        ))
     }
 }
 
@@ -150,6 +315,10 @@ where
 pub struct RetryPolicy {
     pub attempts: usize,
     pub delay_ms: u64,
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay_ms: Option<u64>,
 }
 
 impl Default for RetryPolicy {
@@ -157,8 +326,35 @@ impl Default for RetryPolicy {
         Self {
             attempts: 3,
             delay_ms: 100,
+            backoff_multiplier: default_backoff_multiplier(),
+            max_delay_ms: Some(1_000),
         }
     }
+}
+
+impl RetryPolicy {
+    fn delay_for_attempt(&self, attempt: usize) -> u64 {
+        if self.delay_ms == 0 {
+            return 0;
+        }
+
+        let multiplier = self.backoff_multiplier.max(1) as u128;
+        let mut delay = self.delay_ms as u128;
+        for _ in 0..attempt {
+            delay = delay.saturating_mul(multiplier);
+        }
+
+        let delay = delay.min(self.max_delay_ms.unwrap_or(u64::MAX) as u128);
+        delay.min(u64::MAX as u128) as u64
+    }
+}
+
+fn default_backoff_multiplier() -> u32 {
+    2
+}
+
+fn is_retryable_provider_error(error: &FrameworkError) -> bool {
+    matches!(error, FrameworkError::Provider(_) | FrameworkError::Transport(_))
 }
 
 #[derive(Clone)]
@@ -190,9 +386,45 @@ where
             match self.inner.complete(request.clone()).await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
+                    let retryable = is_retryable_provider_error(&error);
                     last_error = Some(error);
-                    if attempt + 1 < attempts && self.policy.delay_ms > 0 {
-                        sleep(Duration::from_millis(self.policy.delay_ms)).await;
+                    if !retryable {
+                        break;
+                    }
+
+                    let delay_ms = self.policy.delay_for_attempt(attempt);
+                    if attempt + 1 < attempts && delay_ms > 0 {
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            FrameworkError::Provider("retry provider exhausted without an error".into())
+        }))
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        let attempts = self.policy.attempts.max(1);
+        let mut last_error = None;
+
+        for attempt in 0..attempts {
+            match self.inner.complete_stream(request.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    let retryable = is_retryable_provider_error(&error);
+                    last_error = Some(error);
+                    if !retryable {
+                        break;
+                    }
+
+                    let delay_ms = self.policy.delay_for_attempt(attempt);
+                    if attempt + 1 < attempts && delay_ms > 0 {
+                        sleep(Duration::from_millis(delay_ms)).await;
                     }
                 }
             }
@@ -237,6 +469,24 @@ where
         .map_err(|_| {
             FrameworkError::Provider(format!(
                 "provider '{}' timed out after {} ms",
+                self.inner.name(),
+                self.timeout_ms
+            ))
+        })?
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        timeout(
+            Duration::from_millis(self.timeout_ms),
+            self.inner.complete_stream(request),
+        )
+        .await
+        .map_err(|_| {
+            FrameworkError::Provider(format!(
+                "provider '{}' stream setup timed out after {} ms",
                 self.inner.name(),
                 self.timeout_ms
             ))
@@ -294,6 +544,253 @@ impl ModelProvider for FallbackProvider {
             errors.join(" | ")
         )))
     }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        if self.providers.is_empty() {
+            return Err(FrameworkError::Provider(
+                "fallback provider has no configured inner providers".into(),
+            ));
+        }
+
+        let mut errors = Vec::new();
+
+        for provider in &self.providers {
+            match provider.complete_stream(request.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => errors.push(format!("{}: {}", provider.name(), error)),
+            }
+        }
+
+        Err(FrameworkError::Provider(format!(
+            "all fallback providers failed: {}",
+            errors.join(" | ")
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerPolicy {
+    pub failure_threshold: usize,
+    pub open_for_ms: u64,
+}
+
+impl Default for CircuitBreakerPolicy {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 3,
+            open_for_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircuitBreakerSnapshot {
+    pub consecutive_failures: usize,
+    pub is_open: bool,
+    pub open_until_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct CircuitBreakerState {
+    consecutive_failures: usize,
+    open_until_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct CircuitBreakerProvider<P> {
+    inner: P,
+    policy: CircuitBreakerPolicy,
+    state: Arc<Mutex<CircuitBreakerState>>,
+}
+
+impl<P> CircuitBreakerProvider<P>
+where
+    P: ModelProvider,
+{
+    pub fn new(inner: P, policy: CircuitBreakerPolicy) -> Self {
+        Self {
+            inner,
+            policy,
+            state: Arc::new(Mutex::new(CircuitBreakerState::default())),
+        }
+    }
+
+    pub fn snapshot(&self) -> CircuitBreakerSnapshot {
+        snapshot_circuit_state(&self.state)
+    }
+
+    fn guard(&self) -> FrameworkResult<()> {
+        guard_circuit_state(self.inner.name(), &self.state)
+    }
+
+    fn record_success(&self) {
+        reset_circuit_state(&self.state);
+    }
+
+    fn record_failure(&self) {
+        record_circuit_failure(&self.state, &self.policy);
+    }
+}
+
+#[async_trait]
+impl<P> ModelProvider for CircuitBreakerProvider<P>
+where
+    P: ModelProvider,
+{
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> FrameworkResult<CompletionResponse> {
+        self.guard()?;
+
+        match self.inner.complete(request).await {
+            Ok(response) => {
+                self.record_success();
+                Ok(response)
+            }
+            Err(error) => {
+                if is_retryable_provider_error(&error) {
+                    self.record_failure();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        self.guard()?;
+
+        match self.inner.complete_stream(request).await {
+            Ok(mut stream) => {
+                let (sender, receiver) = unbounded_channel();
+                let state = self.state.clone();
+                let policy = self.policy.clone();
+
+                tokio::spawn(async move {
+                    let mut saw_finished = false;
+
+                    while let Some(item) = stream.recv().await {
+                        match &item {
+                            Ok(CompletionEvent::Finished { .. }) => {
+                                reset_circuit_state(&state);
+                                saw_finished = true;
+                            }
+                            Err(error) if is_retryable_provider_error(error) => {
+                                record_circuit_failure(&state, &policy)
+                            }
+                            _ => {}
+                        }
+
+                        if sender.send(item).is_err() {
+                            return;
+                        }
+
+                        if saw_finished {
+                            return;
+                        }
+                    }
+
+                    if !saw_finished {
+                        record_circuit_failure(&state, &policy);
+                    }
+                });
+
+                Ok(CompletionEventStream::from_receiver(receiver))
+            }
+            Err(error) => {
+                if is_retryable_provider_error(&error) {
+                    self.record_failure();
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+fn snapshot_circuit_state(state: &Arc<Mutex<CircuitBreakerState>>) -> CircuitBreakerSnapshot {
+    let now = now_millis();
+    let mut state = lock_mutex(state);
+
+    if state.open_until_ms.is_some_and(|until| until <= now) {
+        state.consecutive_failures = 0;
+        state.open_until_ms = None;
+    }
+
+    let open_until_ms = state.open_until_ms.filter(|until| *until > now);
+
+    CircuitBreakerSnapshot {
+        consecutive_failures: state.consecutive_failures,
+        is_open: open_until_ms.is_some(),
+        open_until_ms,
+    }
+}
+
+fn guard_circuit_state(
+    provider_name: &str,
+    state: &Arc<Mutex<CircuitBreakerState>>,
+) -> FrameworkResult<()> {
+    let now = now_millis();
+    let mut state = lock_mutex(state);
+
+    if let Some(open_until_ms) = state.open_until_ms {
+        if open_until_ms > now {
+            let remaining_ms = open_until_ms.saturating_sub(now);
+            return Err(FrameworkError::Provider(format!(
+                "provider '{}' circuit is open for {} ms after {} consecutive failures",
+                provider_name, remaining_ms, state.consecutive_failures
+            )));
+        }
+
+        state.consecutive_failures = 0;
+        state.open_until_ms = None;
+    }
+
+    Ok(())
+}
+
+fn record_circuit_failure(
+    state: &Arc<Mutex<CircuitBreakerState>>,
+    policy: &CircuitBreakerPolicy,
+) {
+    let mut state = lock_mutex(state);
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+
+    if state.consecutive_failures >= policy.failure_threshold.max(1) {
+        state.open_until_ms = Some(now_millis().saturating_add(policy.open_for_ms.max(1)));
+    }
+}
+
+fn reset_circuit_state(state: &Arc<Mutex<CircuitBreakerState>>) {
+    let mut state = lock_mutex(state);
+    state.consecutive_failures = 0;
+    state.open_until_ms = None;
+}
+
+fn lock_mutex<T>(mutex: &Arc<Mutex<T>>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn new_run_id() -> String {
+    format!("run-{}", Uuid::new_v4())
+}
+
+fn new_stream_id() -> String {
+    format!("stream-{}", Uuid::new_v4())
 }
 
 #[derive(Clone)]
@@ -345,6 +842,22 @@ where
         }
 
         Ok(response)
+    }
+
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> FrameworkResult<CompletionEventStream> {
+        if request.response_schema.is_none() {
+            return self.inner.complete_stream(request).await;
+        }
+
+        let stream_id = request.stream_id.clone();
+        let response = self.complete(request).await?;
+        Ok(CompletionEventStream::from_response_with_stream_id(
+            response,
+            stream_id,
+        ))
     }
 }
 
@@ -531,6 +1044,7 @@ impl ModelProvider for MockProvider {
             }),
             provider: self.name().into(),
             model: request.model,
+            run_id: request.run_id,
         })
     }
 }
@@ -603,6 +1117,7 @@ impl ModelProvider for OpenAICompatibleProvider {
             model,
             system_prompt,
             messages,
+            run_id,
             ..
         } = request;
 
@@ -669,6 +1184,7 @@ impl ModelProvider for OpenAICompatibleProvider {
             structured: None,
             provider: self.name().into(),
             model: response.model.unwrap_or(model),
+            run_id,
         })
     }
 
@@ -680,6 +1196,8 @@ impl ModelProvider for OpenAICompatibleProvider {
             model,
             system_prompt,
             messages,
+            run_id,
+            stream_id,
             ..
         } = request;
 
@@ -722,8 +1240,9 @@ impl ModelProvider for OpenAICompatibleProvider {
 
         let (sender, receiver) = unbounded_channel();
         let provider = self.name().to_string();
+        let envelope = StreamEnvelopeState::from_ids(run_id, stream_id);
         tokio::spawn(async move {
-            stream_openai_response(response, sender, provider, model).await;
+            stream_openai_response(response, sender, provider, model, envelope).await;
         });
 
         Ok(CompletionEventStream::from_receiver(receiver))
@@ -806,6 +1325,7 @@ impl ModelProvider for AnthropicProvider {
             model,
             system_prompt,
             messages,
+            run_id,
             ..
         } = request;
 
@@ -880,6 +1400,7 @@ impl ModelProvider for AnthropicProvider {
             structured: None,
             provider: self.name().into(),
             model: response.model.unwrap_or(model),
+            run_id,
         })
     }
 }
@@ -941,6 +1462,7 @@ impl ModelProvider for OllamaProvider {
             model,
             system_prompt,
             messages,
+            run_id,
             ..
         } = request;
 
@@ -1005,6 +1527,7 @@ impl ModelProvider for OllamaProvider {
             structured: None,
             provider: self.name().into(),
             model: response.model.unwrap_or(model),
+            run_id,
         })
     }
 
@@ -1016,6 +1539,8 @@ impl ModelProvider for OllamaProvider {
             model,
             system_prompt,
             messages,
+            run_id,
+            stream_id,
             ..
         } = request;
 
@@ -1057,8 +1582,9 @@ impl ModelProvider for OllamaProvider {
 
         let (sender, receiver) = unbounded_channel();
         let provider = self.name().to_string();
+        let envelope = StreamEnvelopeState::from_ids(run_id, stream_id);
         tokio::spawn(async move {
-            stream_ollama_response(response, sender, provider, model).await;
+            stream_ollama_response(response, sender, provider, model, envelope).await;
         });
 
         Ok(CompletionEventStream::from_receiver(receiver))
@@ -1190,14 +1716,14 @@ async fn stream_openai_response(
     sender: tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
     provider: String,
     requested_model: String,
+    mut envelope: StreamEnvelopeState,
 ) {
-    let _ = sender.send(Ok(CompletionEvent::Started {
-        provider: provider.clone(),
-        model: requested_model.clone(),
-    }));
+    let _ = sender.send(Ok(envelope.started_event(
+        provider.clone(),
+        requested_model.clone(),
+    )));
 
     let mut buffer = String::new();
-    let mut accumulated = String::new();
     let mut response_model = requested_model;
 
     loop {
@@ -1217,7 +1743,12 @@ async fn stream_openai_response(
                         }
 
                         if data == "[DONE]" {
-                            let _ = finish_stream(&sender, provider.clone(), response_model, accumulated);
+                            let _ = finish_stream(
+                                &sender,
+                                &mut envelope,
+                                provider.clone(),
+                                response_model,
+                            );
                             return;
                         }
 
@@ -1234,16 +1765,15 @@ async fn stream_openai_response(
                                         .or(choice.text)
                                         .filter(|text| !text.is_empty())
                                     {
-                                        accumulated.push_str(&text);
-                                        let _ = sender.send(Ok(CompletionEvent::Delta { text }));
+                                        let _ = sender.send(Ok(envelope.delta_event(text)));
                                     }
 
                                     if choice.finish_reason.is_some() {
                                         let _ = finish_stream(
                                             &sender,
+                                            &mut envelope,
                                             provider.clone(),
                                             response_model.clone(),
-                                            accumulated.clone(),
                                         );
                                         return;
                                     }
@@ -1258,7 +1788,7 @@ async fn stream_openai_response(
                 }
             }
             Ok(None) => {
-                let _ = finish_stream(&sender, provider.clone(), response_model, accumulated);
+                let _ = finish_stream(&sender, &mut envelope, provider.clone(), response_model);
                 return;
             }
             Err(error) => {
@@ -1274,14 +1804,14 @@ async fn stream_ollama_response(
     sender: tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
     provider: String,
     requested_model: String,
+    mut envelope: StreamEnvelopeState,
 ) {
-    let _ = sender.send(Ok(CompletionEvent::Started {
-        provider: provider.clone(),
-        model: requested_model.clone(),
-    }));
+    let _ = sender.send(Ok(envelope.started_event(
+        provider.clone(),
+        requested_model.clone(),
+    )));
 
     let mut buffer = String::new();
-    let mut accumulated = String::new();
     let mut response_model = requested_model;
 
     loop {
@@ -1293,9 +1823,9 @@ async fn stream_ollama_response(
                     if handle_ollama_stream_line(
                         line,
                         &sender,
+                        &mut envelope,
                         &provider,
                         &mut response_model,
-                        &mut accumulated,
                     ) {
                         return;
                     }
@@ -1306,15 +1836,15 @@ async fn stream_ollama_response(
                     && handle_ollama_stream_line(
                         std::mem::take(&mut buffer),
                         &sender,
+                        &mut envelope,
                         &provider,
                         &mut response_model,
-                        &mut accumulated,
                     )
                 {
                     return;
                 }
 
-                let _ = finish_stream(&sender, provider.clone(), response_model, accumulated);
+                let _ = finish_stream(&sender, &mut envelope, provider.clone(), response_model);
                 return;
             }
             Err(error) => {
@@ -1328,9 +1858,9 @@ async fn stream_ollama_response(
 fn handle_ollama_stream_line(
     line: String,
     sender: &tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
+    envelope: &mut StreamEnvelopeState,
     provider: &str,
     response_model: &mut String,
-    accumulated: &mut String,
 ) -> bool {
     let line = line.trim();
     if line.is_empty() {
@@ -1347,17 +1877,11 @@ fn handle_ollama_stream_line(
                 .message
                 .and_then(|message| if message.content.is_empty() { None } else { Some(message.content) })
             {
-                accumulated.push_str(&text);
-                let _ = sender.send(Ok(CompletionEvent::Delta { text }));
+                let _ = sender.send(Ok(envelope.delta_event(text)));
             }
 
             if event.done.unwrap_or(false) {
-                let _ = finish_stream(
-                    sender,
-                    provider.to_string(),
-                    response_model.clone(),
-                    accumulated.clone(),
-                );
+                let _ = finish_stream(sender, envelope, provider.to_string(), response_model.clone());
                 return true;
             }
         }
@@ -1372,18 +1896,17 @@ fn handle_ollama_stream_line(
 
 fn finish_stream(
     sender: &tokio::sync::mpsc::UnboundedSender<FrameworkResult<CompletionEvent>>,
+    envelope: &mut StreamEnvelopeState,
     provider: String,
     model: String,
-    accumulated: String,
 ) -> Result<(), tokio::sync::mpsc::error::SendError<FrameworkResult<CompletionEvent>>> {
-    sender.send(Ok(CompletionEvent::Finished {
-        response: CompletionResponse {
-            text: accumulated,
-            structured: None,
-            provider,
-            model,
-        },
-    }))
+    sender.send(Ok(envelope.finished_event(CompletionResponse {
+        text: String::new(),
+        structured: None,
+        provider,
+        model,
+        run_id: Some(envelope.run_id.clone()),
+    })))
 }
 
 fn take_sse_frame(buffer: &mut String) -> Option<String> {
@@ -1509,6 +2032,7 @@ mod tests {
                 structured: None,
                 provider: self.provider_name.into(),
                 model: request.model,
+                run_id: request.run_id,
             })
         }
     }
@@ -1534,6 +2058,7 @@ mod tests {
                 structured: None,
                 provider: self.provider_name.into(),
                 model: request.model,
+                run_id: request.run_id,
             })
         }
     }
@@ -1567,6 +2092,7 @@ mod tests {
                     structured: None,
                     provider: self.provider_name.into(),
                     model: request.model,
+                    run_id: request.run_id,
                 })
             }
         }
@@ -1594,8 +2120,85 @@ mod tests {
                 structured: None,
                 provider: self.provider_name.into(),
                 model: request.model,
+                run_id: request.run_id,
             })
         }
+    }
+
+    #[derive(Clone)]
+    struct NativeStreamingProvider {
+        provider_name: &'static str,
+        complete_text: &'static str,
+        stream_chunks: Vec<&'static str>,
+        failures_before_stream_success: usize,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for NativeStreamingProvider {
+        fn name(&self) -> &'static str {
+            self.provider_name
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> FrameworkResult<CompletionResponse> {
+            Ok(CompletionResponse {
+                text: self.complete_text.into(),
+                structured: None,
+                provider: self.provider_name.into(),
+                model: request.model,
+                run_id: request.run_id,
+            })
+        }
+
+        async fn complete_stream(
+            &self,
+            request: CompletionRequest,
+        ) -> FrameworkResult<CompletionEventStream> {
+            let call = self.stream_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.failures_before_stream_success {
+                return Err(FrameworkError::Provider(format!(
+                    "{} stream failed on call {}",
+                    self.provider_name, call
+                )));
+            }
+
+            Ok(native_stream(
+                &request,
+                self.provider_name,
+                self.stream_chunks.clone(),
+            ))
+        }
+    }
+
+    fn native_stream(
+        request: &CompletionRequest,
+        provider_name: &str,
+        stream_chunks: Vec<&'static str>,
+    ) -> CompletionEventStream {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut envelope = StreamEnvelopeState::from_request(request);
+        let provider = provider_name.to_string();
+        let model = request.model.clone();
+
+        let _ = sender.send(Ok(envelope.started_event(provider.clone(), model.clone())));
+
+        for chunk in stream_chunks {
+            let _ = sender.send(Ok(envelope.delta_event(chunk.to_string())));
+        }
+
+        let _ = sender.send(Ok(envelope.finished_event(CompletionResponse {
+            text: String::new(),
+            structured: None,
+            provider,
+            model,
+            run_id: Some(envelope.run_id.clone()),
+        })));
+        drop(sender);
+
+        CompletionEventStream::from_receiver(receiver)
     }
 
     fn sample_request() -> CompletionRequest {
@@ -1610,6 +2213,8 @@ mod tests {
             response_schema: None,
             session_id: None,
             tool_choice: ToolChoice::Auto,
+            run_id: None,
+            stream_id: None,
         }
     }
 
@@ -1625,6 +2230,7 @@ mod tests {
             RetryPolicy {
                 attempts: 3,
                 delay_ms: 0,
+                ..RetryPolicy::default()
             },
         );
 
@@ -1632,6 +2238,67 @@ mod tests {
         assert_eq!(response.provider, "flaky");
         assert_eq!(response.text, "flaky ok");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn retry_policy_uses_exponential_backoff_with_cap() {
+        let policy = RetryPolicy {
+            attempts: 4,
+            delay_ms: 10,
+            backoff_multiplier: 3,
+            max_delay_ms: Some(50),
+        };
+
+        assert_eq!(policy.delay_for_attempt(0), 10);
+        assert_eq!(policy.delay_for_attempt(1), 30);
+        assert_eq!(policy.delay_for_attempt(2), 50);
+        assert_eq!(policy.delay_for_attempt(3), 50);
+    }
+
+    #[tokio::test]
+    async fn retry_provider_retries_stream_setup_and_preserves_native_stream() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = RetryProvider::new(
+            NativeStreamingProvider {
+                provider_name: "native-stream",
+                complete_text: "complete-path",
+                stream_chunks: vec!["native ", "stream"],
+                failures_before_stream_success: 1,
+                stream_calls: stream_calls.clone(),
+            },
+            RetryPolicy {
+                attempts: 2,
+                delay_ms: 0,
+                ..RetryPolicy::default()
+            },
+        );
+
+        let mut stream = provider
+            .complete_stream(
+                sample_request()
+                    .with_run_id("run-native-retry")
+                    .with_stream_id("stream-native-retry"),
+            )
+            .await
+            .unwrap();
+
+        let mut deltas = String::new();
+        let mut finished = None;
+
+        while let Some(event) = stream.recv().await {
+            match event.unwrap() {
+                CompletionEvent::Started { .. } => {}
+                CompletionEvent::Delta { text, .. } => deltas.push_str(&text),
+                CompletionEvent::Finished { response, .. } => finished = Some(response),
+            }
+        }
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(deltas, "native stream");
+
+        let finished = finished.unwrap();
+        assert_eq!(finished.text, "native stream");
+        assert_eq!(finished.run_id.as_deref(), Some("run-native-retry"));
     }
 
     #[tokio::test]
@@ -1667,6 +2334,87 @@ mod tests {
         assert_eq!(response.text, "fallback ok");
     }
 
+    #[tokio::test]
+    async fn fallback_provider_stream_uses_second_provider_after_first_failure() {
+        let provider = FallbackProvider::new()
+            .with_provider(NativeStreamingProvider {
+                provider_name: "first-stream",
+                complete_text: "first-complete",
+                stream_chunks: vec!["first"],
+                failures_before_stream_success: usize::MAX,
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            })
+            .with_provider(NativeStreamingProvider {
+                provider_name: "second-stream",
+                complete_text: "second-complete",
+                stream_chunks: vec!["fallback ", "stream"],
+                failures_before_stream_success: 0,
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            });
+
+        let mut stream = provider
+            .complete_stream(
+                sample_request()
+                    .with_run_id("run-fallback-stream")
+                    .with_stream_id("stream-fallback-stream"),
+            )
+            .await
+            .unwrap();
+
+        let mut deltas = String::new();
+        let mut finished = None;
+
+        while let Some(event) = stream.recv().await {
+            match event.unwrap() {
+                CompletionEvent::Started { provider, .. } => assert_eq!(provider, "second-stream"),
+                CompletionEvent::Delta { text, .. } => deltas.push_str(&text),
+                CompletionEvent::Finished { response, .. } => finished = Some(response),
+            }
+        }
+
+        assert_eq!(deltas, "fallback stream");
+
+        let finished = finished.unwrap();
+        assert_eq!(finished.text, "fallback stream");
+        assert_eq!(finished.run_id.as_deref(), Some("run-fallback-stream"));
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_opens_after_failures_and_recovers_after_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CircuitBreakerProvider::new(
+            FlakyProvider {
+                provider_name: "breaker",
+                failures_before_success: 2,
+                calls: calls.clone(),
+            },
+            CircuitBreakerPolicy {
+                failure_threshold: 2,
+                open_for_ms: 25,
+            },
+        );
+
+        provider.complete(sample_request()).await.unwrap_err();
+        assert_eq!(provider.snapshot().consecutive_failures, 1);
+        assert!(!provider.snapshot().is_open);
+
+        provider.complete(sample_request()).await.unwrap_err();
+        assert!(provider.snapshot().is_open);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let open_error = provider.complete(sample_request()).await.unwrap_err();
+        assert!(open_error.to_string().contains("circuit is open"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let response = provider.complete(sample_request()).await.unwrap();
+        assert_eq!(response.text, "breaker ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.snapshot().consecutive_failures, 0);
+        assert!(!provider.snapshot().is_open);
+    }
+
     #[test]
     fn extract_json_value_finds_json_inside_code_fence() {
         let value = extract_json_value("Here you go:\n```json\n{\"answer\":\"hi\"}\n```").unwrap();
@@ -1696,6 +2444,7 @@ mod tests {
             structured: None,
             provider: "mock".into(),
             model: "mock-model".into(),
+            run_id: Some("run-stream-test".into()),
         };
         let expected_text = response.text.clone();
 
@@ -1703,22 +2452,59 @@ mod tests {
         let mut saw_started = false;
         let mut deltas = String::new();
         let mut finished = None;
+        let mut seen_sequences = Vec::new();
+        let mut seen_stream_id = None;
 
         while let Some(event) = stream.recv().await {
             match event.unwrap() {
-                CompletionEvent::Started { provider, model } => {
+                CompletionEvent::Started {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    provider,
+                    model,
+                } => {
                     saw_started = true;
+                    assert_eq!(run_id, "run-stream-test");
                     assert_eq!(provider, "mock");
                     assert_eq!(model, "mock-model");
+                    seen_sequences.push(sequence);
+                    seen_stream_id = Some(stream_id);
                 }
-                CompletionEvent::Delta { text } => deltas.push_str(&text),
-                CompletionEvent::Finished { response } => finished = Some(response),
+                CompletionEvent::Delta {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    offset,
+                    text,
+                } => {
+                    assert_eq!(run_id, "run-stream-test");
+                    assert_eq!(stream_id, seen_stream_id.clone().unwrap());
+                    assert_eq!(offset, deltas.len());
+                    deltas.push_str(&text);
+                    seen_sequences.push(sequence);
+                }
+                CompletionEvent::Finished {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    response,
+                } => {
+                    assert_eq!(run_id, "run-stream-test");
+                    assert_eq!(stream_id, seen_stream_id.clone().unwrap());
+                    seen_sequences.push(sequence);
+                    finished = Some(response);
+                }
             }
         }
 
         assert!(saw_started);
         assert_eq!(deltas, expected_text);
-        assert_eq!(finished.unwrap().text, response.text);
+        assert_eq!(seen_sequences, (0..seen_sequences.len() as u64).collect::<Vec<_>>());
+
+        let finished = finished.unwrap();
+        assert_eq!(finished.text, response.text);
+        assert_eq!(finished.run_id.as_deref(), Some("run-stream-test"));
     }
 
     #[tokio::test]
@@ -1728,30 +2514,71 @@ mod tests {
             text: "hello from stream".into(),
         };
 
-        let mut stream = provider.complete_stream(sample_request()).await.unwrap();
+        let mut stream = provider
+            .complete_stream(
+                sample_request()
+                    .with_run_id("run-static-stream")
+                    .with_stream_id("stream-static-stream"),
+            )
+            .await
+            .unwrap();
         let mut saw_started = false;
         let mut deltas = String::new();
         let mut finished = None;
+        let mut seen_sequences = Vec::new();
 
         while let Some(event) = stream.recv().await {
             match event.unwrap() {
-                CompletionEvent::Started { provider, model } => {
+                CompletionEvent::Started {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    provider,
+                    model,
+                } => {
                     saw_started = true;
+                    assert_eq!(run_id, "run-static-stream");
+                    assert_eq!(stream_id, "stream-static-stream");
                     assert_eq!(provider, "static");
                     assert_eq!(model, "test-model");
+                    seen_sequences.push(sequence);
                 }
-                CompletionEvent::Delta { text } => deltas.push_str(&text),
-                CompletionEvent::Finished { response } => finished = Some(response),
+                CompletionEvent::Delta {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    offset,
+                    text,
+                } => {
+                    assert_eq!(run_id, "run-static-stream");
+                    assert_eq!(stream_id, "stream-static-stream");
+                    assert_eq!(offset, deltas.len());
+                    deltas.push_str(&text);
+                    seen_sequences.push(sequence);
+                }
+                CompletionEvent::Finished {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    response,
+                } => {
+                    assert_eq!(run_id, "run-static-stream");
+                    assert_eq!(stream_id, "stream-static-stream");
+                    seen_sequences.push(sequence);
+                    finished = Some(response);
+                }
             }
         }
 
         assert!(saw_started);
         assert_eq!(deltas, "hello from stream");
+        assert_eq!(seen_sequences, (0..seen_sequences.len() as u64).collect::<Vec<_>>());
 
         let finished = finished.unwrap();
         assert_eq!(finished.provider, "static");
         assert_eq!(finished.model, "test-model");
         assert_eq!(finished.text, "hello from stream");
+        assert_eq!(finished.run_id.as_deref(), Some("run-static-stream"));
     }
 
     #[tokio::test]
@@ -1783,6 +2610,8 @@ mod tests {
                 response_schema: Some(schema.clone()),
                 session_id: None,
                 tool_choice: ToolChoice::Auto,
+                run_id: None,
+                stream_id: None,
             })
             .await
             .unwrap();
@@ -1844,6 +2673,8 @@ mod tests {
                 response_schema: None,
                 session_id: Some("session-openai".into()),
                 tool_choice: ToolChoice::Auto,
+                run_id: None,
+                stream_id: None,
             })
             .await
             .unwrap();
@@ -1896,6 +2727,8 @@ mod tests {
                 response_schema: None,
                 session_id: Some("session-openai-stream".into()),
                 tool_choice: ToolChoice::Auto,
+                run_id: Some("run-openai-stream".into()),
+                stream_id: Some("stream-openai-stream".into()),
             })
             .await
             .unwrap();
@@ -1903,22 +2736,57 @@ mod tests {
         let mut saw_started = false;
         let mut deltas = String::new();
         let mut finished = None;
+        let mut seen_sequences = Vec::new();
 
         while let Some(event) = stream.recv().await {
             match event.unwrap() {
-                CompletionEvent::Started { provider, model } => {
+                CompletionEvent::Started {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    provider,
+                    model,
+                } => {
                     saw_started = true;
+                    assert_eq!(run_id, "run-openai-stream");
+                    assert_eq!(stream_id, "stream-openai-stream");
                     assert_eq!(provider, "openai-compatible");
                     assert_eq!(model, "gpt-test-model");
+                    seen_sequences.push(sequence);
                 }
-                CompletionEvent::Delta { text } => deltas.push_str(&text),
-                CompletionEvent::Finished { response } => finished = Some(response),
+                CompletionEvent::Delta {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    offset,
+                    text,
+                } => {
+                    assert_eq!(run_id, "run-openai-stream");
+                    assert_eq!(stream_id, "stream-openai-stream");
+                    assert_eq!(offset, deltas.len());
+                    deltas.push_str(&text);
+                    seen_sequences.push(sequence);
+                }
+                CompletionEvent::Finished {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    response,
+                } => {
+                    assert_eq!(run_id, "run-openai-stream");
+                    assert_eq!(stream_id, "stream-openai-stream");
+                    seen_sequences.push(sequence);
+                    finished = Some(response);
+                }
             }
         }
 
         assert!(saw_started);
+        assert_eq!(seen_sequences, (0..seen_sequences.len() as u64).collect::<Vec<_>>());
         assert_eq!(deltas, "Hi from OpenAI stream");
-        assert_eq!(finished.unwrap().text, "Hi from OpenAI stream");
+        let finished = finished.unwrap();
+        assert_eq!(finished.text, "Hi from OpenAI stream");
+        assert_eq!(finished.run_id.as_deref(), Some("run-openai-stream"));
 
         let captured = state.take_one();
         assert_eq!(captured.body["stream"], true);
@@ -2017,6 +2885,8 @@ mod tests {
                 response_schema: None,
                 session_id: Some("session-1".into()),
                 tool_choice: ToolChoice::Auto,
+                run_id: None,
+                stream_id: None,
             })
             .await
             .unwrap();
@@ -2127,6 +2997,8 @@ mod tests {
                 response_schema: None,
                 session_id: Some("session-2".into()),
                 tool_choice: ToolChoice::Auto,
+                run_id: None,
+                stream_id: None,
             })
             .await
             .unwrap();
@@ -2228,6 +3100,8 @@ mod tests {
                 response_schema: None,
                 session_id: Some("session-ollama-stream".into()),
                 tool_choice: ToolChoice::Auto,
+                run_id: Some("run-ollama-stream".into()),
+                stream_id: Some("stream-ollama-stream".into()),
             })
             .await
             .unwrap();
@@ -2235,22 +3109,57 @@ mod tests {
         let mut saw_started = false;
         let mut deltas = String::new();
         let mut finished = None;
+        let mut seen_sequences = Vec::new();
 
         while let Some(event) = stream.recv().await {
             match event.unwrap() {
-                CompletionEvent::Started { provider, model } => {
+                CompletionEvent::Started {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    provider,
+                    model,
+                } => {
                     saw_started = true;
+                    assert_eq!(run_id, "run-ollama-stream");
+                    assert_eq!(stream_id, "stream-ollama-stream");
                     assert_eq!(provider, "ollama");
                     assert_eq!(model, "llama-test-model");
+                    seen_sequences.push(sequence);
                 }
-                CompletionEvent::Delta { text } => deltas.push_str(&text),
-                CompletionEvent::Finished { response } => finished = Some(response),
+                CompletionEvent::Delta {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    offset,
+                    text,
+                } => {
+                    assert_eq!(run_id, "run-ollama-stream");
+                    assert_eq!(stream_id, "stream-ollama-stream");
+                    assert_eq!(offset, deltas.len());
+                    deltas.push_str(&text);
+                    seen_sequences.push(sequence);
+                }
+                CompletionEvent::Finished {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    response,
+                } => {
+                    assert_eq!(run_id, "run-ollama-stream");
+                    assert_eq!(stream_id, "stream-ollama-stream");
+                    seen_sequences.push(sequence);
+                    finished = Some(response);
+                }
             }
         }
 
         assert!(saw_started);
+        assert_eq!(seen_sequences, (0..seen_sequences.len() as u64).collect::<Vec<_>>());
         assert_eq!(deltas, "Hi from Ollama stream");
-        assert_eq!(finished.unwrap().text, "Hi from Ollama stream");
+        let finished = finished.unwrap();
+        assert_eq!(finished.text, "Hi from Ollama stream");
+        assert_eq!(finished.run_id.as_deref(), Some("run-ollama-stream"));
 
         let captured = state.take_one();
         assert_eq!(captured.body["stream"], true);

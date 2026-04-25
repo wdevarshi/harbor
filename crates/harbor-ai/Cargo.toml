@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
+uuid.workspace = true
 harbor-core = { path = "../harbor-core" }
 
 [dev-dependencies]

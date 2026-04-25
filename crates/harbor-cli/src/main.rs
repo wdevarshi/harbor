@@ -32,10 +32,12 @@ fn main() -> io::Result<()> {
             println!("- OpenAI-compatible provider: available");
             println!("- Anthropic provider: available");
             println!("- Ollama provider: available");
-            println!("- provider retry/timeout/fallback helpers: available");
+            println!("- provider retry/backoff/timeout/fallback helpers: available");
+            println!("- provider circuit-breaker suppression: available");
             println!("- structured output helpers: available");
             println!("- typed schema helpers: available");
-            println!("- provider/runtime event streaming: available");
+            println!("- structured provider/runtime event streaming envelopes: available");
+            println!("- deterministic final stream reconstruction: available");
             println!("- native OpenAI-compatible/Ollama streaming: available");
             println!("- agent runtime: available");
             println!("- lifecycle task primitives: available");

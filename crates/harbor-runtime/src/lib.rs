@@ -73,6 +73,8 @@ pub struct RuntimeEventStream<M> {
     inner: CompletionEventStream,
     memory: M,
     session_id: String,
+    run_id: String,
+    stream_id: String,
     user_input: Option<String>,
     assistant_recorded: bool,
     buffered_text: String,
@@ -86,16 +88,28 @@ where
         inner: CompletionEventStream,
         memory: M,
         session_id: impl Into<String>,
+        run_id: impl Into<String>,
+        stream_id: impl Into<String>,
         user_input: impl Into<String>,
     ) -> Self {
         Self {
             inner,
             memory,
             session_id: session_id.into(),
+            run_id: run_id.into(),
+            stream_id: stream_id.into(),
             user_input: Some(user_input.into()),
             assistant_recorded: false,
             buffered_text: String::new(),
         }
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
     }
 
     async fn ensure_user_recorded(&mut self) {
@@ -117,18 +131,63 @@ where
         self.assistant_recorded = true;
     }
 
+    fn apply_delta(&mut self, offset: usize, text: &str) {
+        if offset < self.buffered_text.len() {
+            self.buffered_text.truncate(offset);
+        } else if offset > self.buffered_text.len() {
+            warn!(
+                offset,
+                buffered_len = self.buffered_text.len(),
+                run_id = %self.run_id,
+                stream_id = %self.stream_id,
+                "runtime stream delta skipped ahead; appending chunk"
+            );
+        }
+
+        self.buffered_text.push_str(text);
+    }
+
     pub async fn recv(&mut self) -> Option<FrameworkResult<CompletionEvent>> {
         match self.inner.recv().await {
-            Some(Ok(CompletionEvent::Started { provider, model })) => {
+            Some(Ok(CompletionEvent::Started {
+                run_id,
+                stream_id,
+                sequence,
+                provider,
+                model,
+            })) => {
                 self.ensure_user_recorded().await;
-                Some(Ok(CompletionEvent::Started { provider, model }))
+                Some(Ok(CompletionEvent::Started {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    provider,
+                    model,
+                }))
             }
-            Some(Ok(CompletionEvent::Delta { text })) => {
+            Some(Ok(CompletionEvent::Delta {
+                run_id,
+                stream_id,
+                sequence,
+                offset,
+                text,
+            })) => {
                 self.ensure_user_recorded().await;
-                self.buffered_text.push_str(&text);
-                Some(Ok(CompletionEvent::Delta { text }))
+                self.apply_delta(offset, &text);
+                Some(Ok(CompletionEvent::Delta {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    offset,
+                    text,
+                }))
             }
-            Some(Ok(CompletionEvent::Finished { response })) => {
+            Some(Ok(CompletionEvent::Finished {
+                run_id,
+                stream_id,
+                sequence,
+                response,
+            })) => {
                 self.ensure_user_recorded().await;
 
                 let assistant_text = if response.text.is_empty() {
@@ -138,7 +197,12 @@ where
                 };
 
                 self.record_assistant_if_needed(assistant_text).await;
-                Some(Ok(CompletionEvent::Finished { response }))
+                Some(Ok(CompletionEvent::Finished {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    response,
+                }))
             }
             Some(Err(error)) => Some(Err(error)),
             None => None,
@@ -210,6 +274,8 @@ where
             response_schema: None,
             session_id: Some(session_id.to_string()),
             tool_choice: ToolChoice::Auto,
+            run_id: None,
+            stream_id: None,
         }
     }
 
@@ -229,8 +295,15 @@ where
         context: RunContext,
     ) -> FrameworkResult<CompletionResponse> {
         let user_input = user_input.into();
-        let request = self.build_request(session_id, user_input.clone(), &context).await;
-        let response = self.provider.complete(request).await?;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let request = self
+            .build_request(session_id, user_input.clone(), &context)
+            .await
+            .with_run_id(run_id.clone());
+        let mut response = self.provider.complete(request).await?;
+        if response.run_id.is_none() {
+            response.run_id = Some(run_id);
+        }
 
         self.memory
             .append(session_id, MemoryMessage::new("user", user_input))
@@ -281,13 +354,21 @@ where
         context: RunContext,
     ) -> FrameworkResult<RuntimeEventStream<M>> {
         let user_input = user_input.into();
-        let request = self.build_request(session_id, user_input.clone(), &context).await;
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let stream_id = format!("stream-{}", Uuid::new_v4());
+        let request = self
+            .build_request(session_id, user_input.clone(), &context)
+            .await
+            .with_run_id(run_id.clone())
+            .with_stream_id(stream_id.clone());
         let stream = self.provider.complete_stream(request).await?;
 
         Ok(RuntimeEventStream::new(
             stream,
             self.memory.clone(),
             session_id,
+            run_id,
+            stream_id,
             user_input,
         ))
     }
@@ -1405,6 +1486,7 @@ mod tests {
                 structured: None,
                 provider: self.name().into(),
                 model: request.model,
+                run_id: request.run_id,
             })
         }
     }
@@ -1436,24 +1518,60 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(stream.run_id().starts_with("run-"));
+        assert!(stream.stream_id().starts_with("stream-"));
+
         let mut saw_started = false;
         let mut delta_text = String::new();
         let mut finished_text = None;
+        let mut seen_sequences = Vec::new();
 
         while let Some(event) = stream.recv().await {
             match event.unwrap() {
-                CompletionEvent::Started { provider, model } => {
+                CompletionEvent::Started {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    provider,
+                    model,
+                } => {
                     saw_started = true;
+                    assert_eq!(run_id, stream.run_id());
+                    assert_eq!(stream_id, stream.stream_id());
                     assert_eq!(provider, "mock");
                     assert_eq!(model, "mock-gpt");
+                    seen_sequences.push(sequence);
                 }
-                CompletionEvent::Delta { text } => delta_text.push_str(&text),
-                CompletionEvent::Finished { response } => finished_text = Some(response.text),
+                CompletionEvent::Delta {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    offset,
+                    text,
+                } => {
+                    assert_eq!(run_id, stream.run_id());
+                    assert_eq!(stream_id, stream.stream_id());
+                    assert_eq!(offset, delta_text.len());
+                    delta_text.push_str(&text);
+                    seen_sequences.push(sequence);
+                }
+                CompletionEvent::Finished {
+                    run_id,
+                    stream_id,
+                    sequence,
+                    response,
+                } => {
+                    assert_eq!(run_id, stream.run_id());
+                    assert_eq!(stream_id, stream.stream_id());
+                    seen_sequences.push(sequence);
+                    finished_text = Some(response.text);
+                }
             }
         }
 
         let expected = "[mock:stream-session] Hello from streaming Harbor";
         assert!(saw_started);
+        assert_eq!(seen_sequences, (0..seen_sequences.len() as u64).collect::<Vec<_>>());
         assert_eq!(delta_text, expected);
         assert_eq!(finished_text.unwrap(), expected);
 
@@ -1463,6 +1581,19 @@ mod tests {
         assert_eq!(history[0].content, "Hello from streaming Harbor");
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[1].content, expected);
+    }
+
+    #[tokio::test]
+    async fn run_turn_assigns_run_id_to_final_response() {
+        let runtime =
+            AgentRuntime::new(MockProvider, InMemorySessionMemory::default()).with_default_model("mock-gpt");
+
+        let response = runtime
+            .run_turn("run-id-session", "Hello from Harbor")
+            .await
+            .unwrap();
+
+        assert!(response.run_id.unwrap().starts_with("run-"));
     }
 
     #[tokio::test]

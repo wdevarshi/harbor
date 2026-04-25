@@ -22,12 +22,13 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - provider abstraction
   - chat/message types
   - structured completion request/response model
-  - provider event streaming hooks
+  - structured event streaming envelopes with run/stream IDs, sequencing, and delta offsets
   - mock provider for local development and tests
   - OpenAI-compatible provider client
   - Anthropic provider client
   - Ollama provider client
-  - provider retry / timeout / fallback helpers
+  - provider retry / backoff / timeout / fallback helpers
+  - provider circuit-breaker suppression helper
   - structured output helpers
   - outbound trace-context injection on provider HTTP calls
 - **`harbor-memory`**
@@ -43,7 +44,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - prompt injection helpers for retrieved context
 - **`harbor-runtime`**
   - agent runtime
-  - streaming turn API
+  - streaming turn API with deterministic final-response reconstruction
   - retrieval-aware turn execution
   - lifecycle task primitives
   - idempotent task enqueue / dedupe foundations
@@ -120,6 +121,9 @@ cargo run -p harbor-runtime --example hello_agent
 ```bash
 cargo run -p harbor-runtime --example streaming_agent
 ```
+
+Streaming events now carry stable `run_id` / `stream_id` metadata plus monotonic `sequence` numbers.
+Delta events also expose byte `offset`s, and finished events always include the deterministically reconstructed final response text.
 
 ### Run the retrieval-aware agent example
 

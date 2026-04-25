@@ -6,7 +6,7 @@ Harbor is a workspace of focused crates that compose into an AI application plat
 
 - **core**: shared primitives and tool contracts
   - typed schema helpers for tool contracts
-- **ai**: provider abstractions, model-facing types, and event streaming hooks
+- **ai**: provider abstractions, model-facing types, and structured streaming envelopes
 - **memory**: session and state retention, including file-backed persistence
 - **rag**: document ingestion, chunking, retrieval, and prompt injection helpers
 - **runtime**: agents, workflows, streaming turn orchestration, and task lifecycles
@@ -31,7 +31,7 @@ The current baseline includes:
 
 Hosted HTTP providers can also inherit the current trace context so model/API calls participate in the same distributed trace when Harbor is running with OTEL enabled.
 
-The provider layer also includes lightweight reliability wrappers for retry, timeout, fallback, structured-output parsing/validation, and a generic completion event stream (`started` / `delta` / `finished`) so apps can compose resilience and incremental output without rewriting provider orchestration each time.
+The provider layer also includes lightweight reliability wrappers for retry/backoff, timeout, fallback, circuit-breaker suppression, structured-output parsing/validation, and a structured completion event stream (`started` / `delta` / `finished`) with run IDs, stream IDs, sequence numbers, and delta offsets so apps can compose resilience and reconnect-friendly incremental output without rewriting provider orchestration each time. Finished events always carry a deterministically reconstructed final response.
 
 ### 2. Tools
 Tools are defined once and reused in:
