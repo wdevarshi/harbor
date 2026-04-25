@@ -14,7 +14,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs,
@@ -313,6 +313,9 @@ where
     }
 }
 
+pub const TASK_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const TASK_STORE_MANIFEST_FILE_NAME: &str = ".harbor-task-store.json";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -330,44 +333,191 @@ pub struct TaskCheckpoint {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskLease {
+    pub worker_id: String,
+    pub claimed_at_ms: u64,
+    pub heartbeat_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEnqueueOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+impl TaskEnqueueOptions {
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskStoreManifest {
+    pub store_kind: String,
+    pub schema_version: u32,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+impl TaskStoreManifest {
+    fn current(created_at_ms: Option<u64>) -> Self {
+        let now = now_millis();
+        Self {
+            store_kind: "task_store".into(),
+            schema_version: TASK_RECORD_SCHEMA_VERSION,
+            created_at_ms: created_at_ms.unwrap_or(now),
+            updated_at_ms: now,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskStoreBootstrap {
+    pub created_manifest: bool,
+    pub migrated_tasks: usize,
+    pub schema_version: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskRecord {
+    #[serde(default = "task_record_schema_version")]
+    pub schema_version: u32,
     pub id: String,
     pub name: String,
     pub input: JsonValue,
     pub state: TaskState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     pub output: Option<JsonValue>,
     pub error: Option<String>,
     pub attempts: u32,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<TaskLease>,
+    #[serde(default)]
     pub checkpoints: Vec<TaskCheckpoint>,
+}
+
+fn task_record_schema_version() -> u32 {
+    TASK_RECORD_SCHEMA_VERSION
 }
 
 impl TaskRecord {
     pub fn queued(name: impl Into<String>, input: JsonValue) -> Self {
+        Self::queued_with_options(name, input, TaskEnqueueOptions::default())
+    }
+
+    pub fn queued_with_options(
+        name: impl Into<String>,
+        input: JsonValue,
+        options: TaskEnqueueOptions,
+    ) -> Self {
         let now = now_millis();
         Self {
+            schema_version: TASK_RECORD_SCHEMA_VERSION,
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             input,
             state: TaskState::Queued,
+            idempotency_key: options.idempotency_key,
             output: None,
             error: None,
             attempts: 0,
             created_at_ms: now,
             updated_at_ms: now,
+            lease: None,
             checkpoints: Vec::new(),
+        }
+    }
+
+    fn is_claimable(&self, now_ms: u64) -> bool {
+        match self.state {
+            TaskState::Queued => true,
+            TaskState::Running => self
+                .lease
+                .as_ref()
+                .map(|lease| lease.expires_at_ms <= now_ms)
+                .unwrap_or(true),
+            TaskState::Completed | TaskState::Failed | TaskState::Cancelled => false,
+        }
+    }
+
+    fn claim(&mut self, worker_id: impl Into<String>, lease_ttl_ms: u64) {
+        let now = now_millis();
+        self.schema_version = TASK_RECORD_SCHEMA_VERSION;
+        self.state = TaskState::Running;
+        self.attempts += 1;
+        self.error = None;
+        self.updated_at_ms = now;
+        self.lease = Some(TaskLease {
+            worker_id: worker_id.into(),
+            claimed_at_ms: now,
+            heartbeat_at_ms: now,
+            expires_at_ms: now.saturating_add(lease_ttl_ms.max(1)),
+        });
+    }
+
+    fn refresh_lease(&mut self, worker_id: &str, lease_ttl_ms: u64) -> FrameworkResult<()> {
+        let now = now_millis();
+        let lease = self.lease.as_mut().ok_or_else(|| {
+            FrameworkError::Memory(format!("task '{}' has no active lease", self.id))
+        })?;
+
+        if lease.worker_id != worker_id {
+            return Err(FrameworkError::Memory(format!(
+                "task '{}' lease is owned by '{}'",
+                self.id, lease.worker_id
+            )));
+        }
+
+        lease.heartbeat_at_ms = now;
+        lease.expires_at_ms = now.saturating_add(lease_ttl_ms.max(1));
+        self.updated_at_ms = now;
+        Ok(())
+    }
+
+    fn clear_lease(&mut self) {
+        self.lease = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskInsertResult {
+    Created(TaskRecord),
+    Existing(TaskRecord),
+}
+
+impl TaskInsertResult {
+    pub fn was_created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+
+    pub fn task(&self) -> &TaskRecord {
+        match self {
+            Self::Created(task) | Self::Existing(task) => task,
+        }
+    }
+
+    pub fn into_task(self) -> TaskRecord {
+        match self {
+            Self::Created(task) | Self::Existing(task) => task,
         }
     }
 }
 
 #[async_trait]
 pub trait TaskStore: Send + Sync + Clone + 'static {
+    async fn create(&self, task: TaskRecord) -> FrameworkResult<TaskInsertResult>;
     async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord>;
     async fn get(&self, id: &str) -> FrameworkResult<Option<TaskRecord>>;
     async fn list(&self) -> FrameworkResult<Vec<TaskRecord>>;
     async fn delete(&self, id: &str) -> FrameworkResult<()>;
+    async fn claim_next(&self, worker_id: &str, lease_ttl_ms: u64)
+        -> FrameworkResult<Option<TaskRecord>>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -377,6 +527,23 @@ pub struct InMemoryTaskStore {
 
 #[async_trait]
 impl TaskStore for InMemoryTaskStore {
+    async fn create(&self, task: TaskRecord) -> FrameworkResult<TaskInsertResult> {
+        let mut guard = self.inner.write().await;
+
+        if let Some(key) = task.idempotency_key.as_deref() {
+            if let Some(existing) = guard
+                .values()
+                .find(|candidate| task_matches_idempotency(candidate, &task.name, key))
+                .cloned()
+            {
+                return Ok(TaskInsertResult::Existing(existing));
+            }
+        }
+
+        guard.insert(task.id.clone(), task.clone());
+        Ok(TaskInsertResult::Created(task))
+    }
+
     async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord> {
         self.inner
             .write()
@@ -391,13 +558,37 @@ impl TaskStore for InMemoryTaskStore {
 
     async fn list(&self) -> FrameworkResult<Vec<TaskRecord>> {
         let mut tasks = self.inner.read().await.values().cloned().collect::<Vec<_>>();
-        tasks.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+        tasks.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)));
         Ok(tasks)
     }
 
     async fn delete(&self, id: &str) -> FrameworkResult<()> {
         self.inner.write().await.remove(id);
         Ok(())
+    }
+
+    async fn claim_next(
+        &self,
+        worker_id: &str,
+        lease_ttl_ms: u64,
+    ) -> FrameworkResult<Option<TaskRecord>> {
+        let now = now_millis();
+        let mut guard = self.inner.write().await;
+
+        let Some(task_id) = guard
+            .values()
+            .filter(|task| task.is_claimable(now))
+            .min_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)))
+            .map(|task| task.id.clone())
+        else {
+            return Ok(None);
+        };
+
+        let task = guard
+            .get_mut(&task_id)
+            .ok_or_else(|| FrameworkError::Memory(format!("task '{}' not found", task_id)))?;
+        task.claim(worker_id.to_string(), lease_ttl_ms);
+        Ok(Some(task.clone()))
     }
 }
 
@@ -419,54 +610,198 @@ impl FileTaskStore {
         self.root.as_ref().as_path()
     }
 
+    pub fn manifest_path(&self) -> PathBuf {
+        self.root.join(TASK_STORE_MANIFEST_FILE_NAME)
+    }
+
     fn task_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.json"))
     }
-}
 
-#[async_trait]
-impl TaskStore for FileTaskStore {
-    async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord> {
+    pub async fn bootstrap(&self) -> FrameworkResult<TaskStoreBootstrap> {
         let _guard = self.write_lock.lock().await;
-        fs::create_dir_all(self.root()).await?;
-        let path = self.task_path(&task.id);
-        fs::write(path, serde_json::to_string_pretty(&task)?).await?;
-        Ok(task)
+        self.bootstrap_locked().await
     }
 
-    async fn get(&self, id: &str) -> FrameworkResult<Option<TaskRecord>> {
-        let path = self.task_path(id);
-        match fs::read_to_string(path).await {
-            Ok(content) => Ok(Some(serde_json::from_str(&content)?)),
+    async fn bootstrap_locked(&self) -> FrameworkResult<TaskStoreBootstrap> {
+        fs::create_dir_all(self.root()).await?;
+
+        let existing_manifest = self.read_manifest_locked().await?;
+        let created_manifest = existing_manifest.is_none();
+        let mut manifest = existing_manifest
+            .unwrap_or_else(|| TaskStoreManifest::current(None));
+        let mut migrated_tasks = 0usize;
+
+        let mut entries = fs::read_dir(self.root()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+
+            let path = entry.path();
+            if path == self.manifest_path() {
+                continue;
+            }
+
+            let content = fs::read_to_string(&path).await?;
+            let (task, needs_rewrite) = decode_task_record(&content)?;
+            if needs_rewrite {
+                self.write_task_locked(&task).await?;
+                migrated_tasks += 1;
+            }
+        }
+
+        manifest.schema_version = TASK_RECORD_SCHEMA_VERSION;
+        manifest.updated_at_ms = now_millis();
+        self.write_manifest_locked(&manifest).await?;
+
+        Ok(TaskStoreBootstrap {
+            created_manifest,
+            migrated_tasks,
+            schema_version: TASK_RECORD_SCHEMA_VERSION,
+        })
+    }
+
+    async fn read_manifest_locked(&self) -> FrameworkResult<Option<TaskStoreManifest>> {
+        match fs::read_to_string(self.manifest_path()).await {
+            Ok(content) => Ok(serde_json::from_str(&content).ok()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
-    async fn list(&self) -> FrameworkResult<Vec<TaskRecord>> {
-        fs::create_dir_all(self.root()).await?;
+    async fn write_manifest_locked(&self, manifest: &TaskStoreManifest) -> FrameworkResult<()> {
+        fs::write(self.manifest_path(), serde_json::to_string_pretty(manifest)?).await?;
+        Ok(())
+    }
+
+    async fn get_locked(&self, id: &str) -> FrameworkResult<Option<TaskRecord>> {
+        match fs::read_to_string(self.task_path(id)).await {
+            Ok(content) => Ok(Some(decode_task_record(&content)?.0)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn list_locked(&self) -> FrameworkResult<Vec<TaskRecord>> {
         let mut entries = fs::read_dir(self.root()).await?;
-        let mut tasks: Vec<TaskRecord> = Vec::new();
+        let mut tasks = Vec::new();
 
         while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                let content = fs::read_to_string(entry.path()).await?;
-                tasks.push(serde_json::from_str(&content)?);
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+
+            if entry.path() == self.manifest_path() {
+                continue;
+            }
+
+            let content = fs::read_to_string(entry.path()).await?;
+            tasks.push(decode_task_record(&content)?.0);
+        }
+
+        tasks.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms).then(a.id.cmp(&b.id)));
+        Ok(tasks)
+    }
+
+    async fn write_task_locked(&self, task: &TaskRecord) -> FrameworkResult<()> {
+        let mut persisted = task.clone();
+        persisted.schema_version = TASK_RECORD_SCHEMA_VERSION;
+        fs::write(
+            self.task_path(&persisted.id),
+            serde_json::to_string_pretty(&persisted)?,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+fn task_matches_idempotency(task: &TaskRecord, task_name: &str, key: &str) -> bool {
+    task.name == task_name && task.idempotency_key.as_deref() == Some(key)
+}
+
+fn decode_task_record(content: &str) -> FrameworkResult<(TaskRecord, bool)> {
+    let value: JsonValue = serde_json::from_str(content)?;
+    let mut task: TaskRecord = serde_json::from_value(value.clone())?;
+    let needs_rewrite = value
+        .get("schema_version")
+        .and_then(|candidate| candidate.as_u64())
+        != Some(TASK_RECORD_SCHEMA_VERSION as u64);
+    task.schema_version = TASK_RECORD_SCHEMA_VERSION;
+    Ok((task, needs_rewrite))
+}
+
+#[async_trait]
+impl TaskStore for FileTaskStore {
+    async fn create(&self, task: TaskRecord) -> FrameworkResult<TaskInsertResult> {
+        let _guard = self.write_lock.lock().await;
+        self.bootstrap_locked().await?;
+
+        if let Some(key) = task.idempotency_key.as_deref() {
+            if let Some(existing) = self
+                .list_locked()
+                .await?
+                .into_iter()
+                .find(|candidate| task_matches_idempotency(candidate, &task.name, key))
+            {
+                return Ok(TaskInsertResult::Existing(existing));
             }
         }
 
-        tasks.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
-        Ok(tasks)
+        self.write_task_locked(&task).await?;
+        Ok(TaskInsertResult::Created(task))
+    }
+
+    async fn put(&self, task: TaskRecord) -> FrameworkResult<TaskRecord> {
+        let _guard = self.write_lock.lock().await;
+        self.bootstrap_locked().await?;
+        self.write_task_locked(&task).await?;
+        Ok(task)
+    }
+
+    async fn get(&self, id: &str) -> FrameworkResult<Option<TaskRecord>> {
+        let _guard = self.write_lock.lock().await;
+        self.bootstrap_locked().await?;
+        self.get_locked(id).await
+    }
+
+    async fn list(&self) -> FrameworkResult<Vec<TaskRecord>> {
+        let _guard = self.write_lock.lock().await;
+        self.bootstrap_locked().await?;
+        self.list_locked().await
     }
 
     async fn delete(&self, id: &str) -> FrameworkResult<()> {
         let _guard = self.write_lock.lock().await;
-        let path = self.task_path(id);
-        match fs::remove_file(path).await {
+        self.bootstrap_locked().await?;
+        match fs::remove_file(self.task_path(id)).await {
             Ok(_) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn claim_next(
+        &self,
+        worker_id: &str,
+        lease_ttl_ms: u64,
+    ) -> FrameworkResult<Option<TaskRecord>> {
+        let _guard = self.write_lock.lock().await;
+        self.bootstrap_locked().await?;
+
+        let now = now_millis();
+        let Some(mut task) = self
+            .list_locked()
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.is_claimable(now))
+        else {
+            return Ok(None);
+        };
+
+        task.claim(worker_id.to_string(), lease_ttl_ms);
+        self.write_task_locked(&task).await?;
+        Ok(Some(task))
     }
 }
 
@@ -487,18 +822,72 @@ where
         &self.store
     }
 
-    pub async fn enqueue(&self, name: impl Into<String>, input: JsonValue) -> FrameworkResult<TaskRecord> {
-        self.store.put(TaskRecord::queued(name, input)).await
+    pub async fn enqueue(
+        &self,
+        name: impl Into<String>,
+        input: JsonValue,
+    ) -> FrameworkResult<TaskRecord> {
+        self.enqueue_with_options(name, input, TaskEnqueueOptions::default())
+            .await
+    }
+
+    pub async fn enqueue_with_options(
+        &self,
+        name: impl Into<String>,
+        input: JsonValue,
+        options: TaskEnqueueOptions,
+    ) -> FrameworkResult<TaskRecord> {
+        Ok(self
+            .store
+            .create(TaskRecord::queued_with_options(name, input, options))
+            .await?
+            .into_task())
+    }
+
+    pub async fn enqueue_idempotent(
+        &self,
+        name: impl Into<String>,
+        input: JsonValue,
+        idempotency_key: impl Into<String>,
+    ) -> FrameworkResult<TaskRecord> {
+        self.enqueue_with_options(
+            name,
+            input,
+            TaskEnqueueOptions::default().with_idempotency_key(idempotency_key),
+        )
+        .await
+    }
+
+    pub async fn claim_next(
+        &self,
+        worker_id: &str,
+        lease_ttl_ms: u64,
+    ) -> FrameworkResult<Option<TaskRecord>> {
+        self.store.claim_next(worker_id, lease_ttl_ms).await
     }
 
     pub async fn start(&self, id: &str) -> FrameworkResult<TaskRecord> {
         self.update(id, |task| {
+            task.schema_version = TASK_RECORD_SCHEMA_VERSION;
             task.state = TaskState::Running;
             task.attempts += 1;
             task.error = None;
+            task.clear_lease();
             task.updated_at_ms = now_millis();
+            Ok(())
         })
         .await
+    }
+
+    pub async fn heartbeat(
+        &self,
+        id: &str,
+        worker_id: impl Into<String>,
+        lease_ttl_ms: u64,
+    ) -> FrameworkResult<TaskRecord> {
+        let worker_id = worker_id.into();
+        self.update(id, move |task| task.refresh_lease(&worker_id, lease_ttl_ms))
+            .await
     }
 
     pub async fn checkpoint(
@@ -515,6 +904,7 @@ where
                 created_at_ms: now_millis(),
             });
             task.updated_at_ms = now_millis();
+            Ok(())
         })
         .await
     }
@@ -524,7 +914,9 @@ where
             task.state = TaskState::Completed;
             task.output = Some(output.clone());
             task.error = None;
+            task.clear_lease();
             task.updated_at_ms = now_millis();
+            Ok(())
         })
         .await
     }
@@ -534,32 +926,186 @@ where
         self.update(id, move |task| {
             task.state = TaskState::Failed;
             task.error = Some(error.clone());
+            task.clear_lease();
             task.updated_at_ms = now_millis();
+            Ok(())
         })
         .await
     }
 
-    pub async fn cancel(&self, id: &str, reason: impl Into<String>) -> FrameworkResult<TaskRecord> {
+    pub async fn cancel(
+        &self,
+        id: &str,
+        reason: impl Into<String>,
+    ) -> FrameworkResult<TaskRecord> {
         let reason = reason.into();
         self.update(id, move |task| {
             task.state = TaskState::Cancelled;
             task.error = Some(reason.clone());
+            task.clear_lease();
             task.updated_at_ms = now_millis();
+            Ok(())
         })
         .await
     }
 
     async fn update<F>(&self, id: &str, mut mutator: F) -> FrameworkResult<TaskRecord>
     where
-        F: FnMut(&mut TaskRecord) + Send,
+        F: FnMut(&mut TaskRecord) -> FrameworkResult<()> + Send,
     {
         let mut task = self
             .store
             .get(id)
             .await?
             .ok_or_else(|| FrameworkError::Memory(format!("task '{id}' not found")))?;
-        mutator(&mut task);
+        mutator(&mut task)?;
         self.store.put(task).await
+    }
+}
+
+#[async_trait]
+pub trait BackgroundTaskHandler: Send + Sync {
+    fn task_name(&self) -> &'static str;
+    async fn run(&self, task: TaskRecord) -> FrameworkResult<JsonValue>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundTaskRunnerConfig {
+    pub worker_id: String,
+    pub poll_interval_ms: u64,
+    pub lease_ttl_ms: u64,
+    pub heartbeat_interval_ms: u64,
+}
+
+impl Default for BackgroundTaskRunnerConfig {
+    fn default() -> Self {
+        Self {
+            worker_id: format!("worker-{}", Uuid::new_v4()),
+            poll_interval_ms: 500,
+            lease_ttl_ms: 5_000,
+            heartbeat_interval_ms: 1_000,
+        }
+    }
+}
+
+pub struct BackgroundTaskRunner<S> {
+    lifecycle: TaskLifecycle<S>,
+    config: BackgroundTaskRunnerConfig,
+    handlers: HashMap<String, Arc<dyn BackgroundTaskHandler>>,
+}
+
+impl<S> BackgroundTaskRunner<S>
+where
+    S: TaskStore,
+{
+    pub fn new(lifecycle: TaskLifecycle<S>) -> Self {
+        Self {
+            lifecycle,
+            config: BackgroundTaskRunnerConfig::default(),
+            handlers: HashMap::new(),
+        }
+    }
+
+    pub fn with_config(mut self, config: BackgroundTaskRunnerConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_handler<H>(mut self, handler: H) -> Self
+    where
+        H: BackgroundTaskHandler + 'static,
+    {
+        self.handlers
+            .insert(handler.task_name().to_string(), Arc::new(handler));
+        self
+    }
+
+    pub fn register_handler_arc(&mut self, handler: Arc<dyn BackgroundTaskHandler>) {
+        self.handlers.insert(handler.task_name().to_string(), handler);
+    }
+
+    pub fn config(&self) -> &BackgroundTaskRunnerConfig {
+        &self.config
+    }
+
+    pub async fn run_once(&self) -> FrameworkResult<Option<TaskRecord>> {
+        let Some(task) = self
+            .lifecycle
+            .claim_next(&self.config.worker_id, self.config.lease_ttl_ms)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let Some(handler) = self.handlers.get(&task.name).cloned() else {
+            return Ok(Some(
+                self.lifecycle
+                    .fail(
+                        &task.id,
+                        format!(
+                            "no background handler registered for task '{}'",
+                            task.name.clone()
+                        ),
+                    )
+                    .await?,
+            ));
+        };
+
+        self.lifecycle
+            .checkpoint(
+                &task.id,
+                "claimed",
+                serde_json::json!({
+                    "worker_id": self.config.worker_id.clone(),
+                    "attempt": task.attempts,
+                }),
+            )
+            .await?;
+
+        let lifecycle = self.lifecycle.clone();
+        let task_id = task.id.clone();
+        let worker_id = self.config.worker_id.clone();
+        let lease_ttl_ms = self.config.lease_ttl_ms;
+        let heartbeat_interval_ms = self.config.heartbeat_interval_ms.max(1);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = tokio::time::sleep(Duration::from_millis(heartbeat_interval_ms)) => {
+                        let _ = lifecycle.heartbeat(&task_id, &worker_id, lease_ttl_ms).await;
+                    }
+                }
+            }
+        });
+
+        let result = handler.run(task.clone()).await;
+        let _ = stop_tx.send(());
+        let _ = heartbeat.await;
+
+        match result {
+            Ok(output) => Ok(Some(self.lifecycle.complete(&task.id, output).await?)),
+            Err(error) => Ok(Some(self.lifecycle.fail(&task.id, error.to_string()).await?)),
+        }
+    }
+
+    pub async fn run_until_shutdown<F>(&self, shutdown_signal: F) -> FrameworkResult<()>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        tokio::pin!(shutdown_signal);
+
+        loop {
+            if self.run_once().await?.is_some() {
+                continue;
+            }
+
+            tokio::select! {
+                _ = &mut shutdown_signal => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(self.config.poll_interval_ms.max(1))) => {}
+            }
+        }
     }
 }
 
@@ -863,6 +1409,22 @@ mod tests {
         }
     }
 
+    struct EchoTaskHandler;
+
+    #[async_trait]
+    impl BackgroundTaskHandler for EchoTaskHandler {
+        fn task_name(&self) -> &'static str {
+            "summarize-docs"
+        }
+
+        async fn run(&self, task: TaskRecord) -> FrameworkResult<JsonValue> {
+            Ok(serde_json::json!({
+                "task_id": task.id,
+                "doc": task.input["doc"].clone(),
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn run_turn_stream_emits_events_and_persists_memory() {
         let memory = InMemorySessionMemory::default();
@@ -967,6 +1529,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_lifecycle_deduplicates_idempotent_enqueue_requests() {
+        let lifecycle = TaskLifecycle::new(InMemoryTaskStore::default());
+
+        let first = lifecycle
+            .enqueue_idempotent(
+                "summarize-docs",
+                serde_json::json!({"doc": "abc"}),
+                "job-123",
+            )
+            .await
+            .unwrap();
+
+        let second = lifecycle
+            .enqueue_idempotent(
+                "summarize-docs",
+                serde_json::json!({"doc": "different"}),
+                "job-123",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.input["doc"], "abc");
+        assert_eq!(lifecycle.store().list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_store_reclaims_expired_running_leases() {
+        let store = InMemoryTaskStore::default();
+        let mut task = TaskRecord::queued("sync", serde_json::json!({"kind": "delta"}));
+        task.state = TaskState::Running;
+        task.attempts = 1;
+        task.lease = Some(TaskLease {
+            worker_id: "worker-old".into(),
+            claimed_at_ms: 1,
+            heartbeat_at_ms: 1,
+            expires_at_ms: 0,
+        });
+        let task_id = task.id.clone();
+        store.put(task).await.unwrap();
+
+        let claimed = store.claim_next("worker-new", 250).await.unwrap().unwrap();
+
+        assert_eq!(claimed.id, task_id);
+        assert_eq!(claimed.state, TaskState::Running);
+        assert_eq!(claimed.attempts, 2);
+        assert_eq!(claimed.lease.unwrap().worker_id, "worker-new");
+    }
+
+    #[tokio::test]
+    async fn background_task_runner_executes_claimed_work() {
+        let lifecycle = TaskLifecycle::new(InMemoryTaskStore::default());
+        let queued = lifecycle
+            .enqueue("summarize-docs", serde_json::json!({"doc": "abc"}))
+            .await
+            .unwrap();
+
+        let runner = BackgroundTaskRunner::new(lifecycle.clone())
+            .with_config(BackgroundTaskRunnerConfig {
+                worker_id: "worker-test".into(),
+                poll_interval_ms: 10,
+                lease_ttl_ms: 250,
+                heartbeat_interval_ms: 25,
+            })
+            .with_handler(EchoTaskHandler);
+
+        let finished = runner.run_once().await.unwrap().unwrap();
+        assert_eq!(finished.id, queued.id);
+        assert_eq!(finished.state, TaskState::Completed);
+        assert_eq!(finished.output.unwrap()["doc"], "abc");
+
+        let stored = lifecycle.store().get(&queued.id).await.unwrap().unwrap();
+        assert!(stored.lease.is_none());
+        assert_eq!(stored.checkpoints.len(), 1);
+        assert_eq!(stored.checkpoints[0].label, "claimed");
+    }
+
+    #[tokio::test]
     async fn file_task_store_persists_tasks_between_instances() {
         let root = temp_dir("harbor-task-store-test");
         let store = FileTaskStore::new(&root);
@@ -977,6 +1617,53 @@ mod tests {
         let restored = FileTaskStore::new(&root);
         let fetched = restored.get(&id).await.unwrap().unwrap();
         assert_eq!(fetched, task);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn file_task_store_bootstrap_migrates_legacy_task_files() {
+        let root = temp_dir("harbor-task-store-bootstrap-test");
+        let task_id = "legacy-task";
+
+        std::fs::write(
+            root.join(format!("{task_id}.json")),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": task_id,
+                "name": "sync",
+                "input": {"kind": "delta"},
+                "state": "queued",
+                "output": null,
+                "error": null,
+                "attempts": 0,
+                "created_at_ms": 1,
+                "updated_at_ms": 1,
+                "checkpoints": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = FileTaskStore::new(&root);
+        let bootstrap = store.bootstrap().await.unwrap();
+        assert!(bootstrap.created_manifest);
+        assert_eq!(bootstrap.migrated_tasks, 1);
+
+        let manifest: TaskStoreManifest = serde_json::from_str(
+            &std::fs::read_to_string(store.manifest_path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.schema_version, TASK_RECORD_SCHEMA_VERSION);
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(format!("{task_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(raw["schema_version"], TASK_RECORD_SCHEMA_VERSION);
+
+        let fetched = store.get(task_id).await.unwrap().unwrap();
+        assert_eq!(fetched.schema_version, TASK_RECORD_SCHEMA_VERSION);
+        assert_eq!(fetched.name, "sync");
 
         let _ = std::fs::remove_dir_all(root);
     }

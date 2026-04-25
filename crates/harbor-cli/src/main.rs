@@ -39,9 +39,13 @@ fn main() -> io::Result<()> {
             println!("- native OpenAI-compatible/Ollama streaming: available");
             println!("- agent runtime: available");
             println!("- lifecycle task primitives: available");
+            println!("- idempotent task enqueue foundations: available");
+            println!("- background task runner + lease claiming: available");
+            println!("- versioned task/session persistence manifests: available");
             println!("- shared HarborApp bootstrap: available");
             println!("- session memory: available");
             println!("- file-backed session memory: available");
+            println!("- file store bootstrap + legacy migration scaffolding: available");
             println!("- document store + lexical retrieval: available");
             println!("- prompt injection helpers: available");
             println!("- MCP server primitives: available");

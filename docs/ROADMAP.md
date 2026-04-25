@@ -18,6 +18,9 @@
 - document store + lexical retrieval + prompt injection helpers
 - agent runtime
 - lifecycle task primitives with checkpoints
+- versioned file-backed persistence manifests + migration scaffolding
+- idempotent task enqueue / run dedupe foundations
+- lease-based background task runner primitives
 - workflow engine
 - shared `HarborApp` runtime/bootstrap entrypoint
 - signal-driven graceful shutdown wiring for the shared app runtime
@@ -41,6 +44,7 @@
 
 ## Phase 2 - Runtime and ops
 - richer lifecycle hooks for background workers and subsystems
+- reconnect/resume-friendly structured streaming surfaces
 - OTEL log/metric exporter options
 - broader behavioral test coverage across crates
 

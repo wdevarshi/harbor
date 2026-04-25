@@ -47,6 +47,8 @@ The baseline now includes both in-memory and file-backed session memory, while t
 - vector stores
 - hybrid memory
 
+File-backed memory now carries an explicit persistence manifest and versioned on-disk records so apps have a clean bootstrap/migration seam as storage evolves.
+
 ### 4. Retrieval / documents
 The retrieval layer keeps document-oriented augmentation separate from conversational memory.
 It currently provides:
@@ -64,6 +66,9 @@ Runtime orchestrates:
 - streaming turn execution
 - retrieval-aware turn execution
 - lifecycle task state transitions and checkpoints
+- idempotent task creation / dedupe keys
+- lease-based task claiming for durable background work
+- versioned file-backed task persistence with migration bootstrap
 - tool registry access
 - workflow state transitions
 - shared application bootstrap (`HarborApp`)

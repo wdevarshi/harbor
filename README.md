@@ -34,6 +34,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - session memory trait
   - in-memory implementation
   - file-backed persistent session memory
+  - versioned persistence manifest + bootstrap migration seam
 - **`harbor-rag`**
   - document store abstraction
   - in-memory + file-backed document stores
@@ -45,7 +46,10 @@ It is inspired by modern AI application platforms and documentation patterns lik
   - streaming turn API
   - retrieval-aware turn execution
   - lifecycle task primitives
+  - idempotent task enqueue / dedupe foundations
   - in-memory + file-backed task stores
+  - versioned task store manifest + legacy migration seam
+  - lease-based background task runner
   - workflow engine
   - reusable execution context
   - shared `HarborApp` bootstrap entrypoint
@@ -77,6 +81,7 @@ It is inspired by modern AI application platforms and documentation patterns lik
 - **`harbor-cli`**
   - `new` command to scaffold a new AI solution
   - `doctor` command to explain workspace capabilities
+  - production-readiness visibility for persistence/task foundations
 
 ## Workspace layout
 
